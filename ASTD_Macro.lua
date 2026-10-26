@@ -53,6 +53,8 @@ if type(oldInstance) == "table" then
     end
 end
 
+print("[ASTD Macro] Bootstrap 1/5: เริ่มต้น v2.0.1")
+
 -- ============================================================================
 -- 01) ค่าคงที่ บริการ และธีม
 -- ============================================================================
@@ -5440,6 +5442,10 @@ end
 -- UI ของเกม (ช่องเลือกตัวละคร ปุ่มอัปเกรด จอยมือถือ) อยู่กับที่บนหน้าจอ
 -- จึงไม่ควรฝัง world anchor เพราะเมื่อกล้องเปลี่ยนจะทำให้คลิกพลาดปุ่ม
 -- Phase 1: เก็บเส้นทางของ GUI เป้าหมายเพื่อตรวจซ้ำก่อนคลิก
+-- ฟังก์ชันกลุ่มนี้อยู่ใน do-block เพื่อลดจำนวน local ของ chunk หลัก
+-- (Luau จำกัด 200 local registers; ถ้าเกิน executor จะ compile ไม่ผ่านและเมนูไม่ขึ้น)
+local GuiTargeting = {}
+do
 local function guiRootEntries()
     local entries = {}
     local okCore, coreGui = pcall(function()
@@ -5658,7 +5664,7 @@ local function captureGuiTarget(x, y)
 end
 
 local function pointOverGameGui(x, y)
-    local target, _, checked, ownBlocked = guiTargetAt(x, y)
+    local target, _, checked, ownBlocked = GuiTargeting.guiTargetAt(x, y)
     if target or ownBlocked then
         return true
     end
@@ -5917,11 +5923,25 @@ local function resolveGuiTargetPoint(gui)
     return x, y
 end
 
-local function roundedPosition(position)
+-- ส่งออกเฉพาะฟังก์ชันที่ถูกเรียกจากภายนอก do-block
+GuiTargeting.guiTargetAt = guiTargetAt
+GuiTargeting.captureGuiTarget = captureGuiTarget
+GuiTargeting.pointOverGameGui = pointOverGameGui
+GuiTargeting.isLikelyUpgradeGui = isLikelyUpgradeGui
+GuiTargeting.isLikelySelectionWorld = isLikelySelectionWorld
+GuiTargeting.bindUpgradeSelection = bindUpgradeSelection
+GuiTargeting.resolveGuiTargetPoint = resolveGuiTargetPoint
+end
+
+-- ฟังก์ชันกลุ่มบันทึก/โปรไฟล์ย้ายไปอยู่ในตาราง Rec เพื่อลดจำนวน local register ของ chunk หลัก
+-- (Luau จำกัด 200 registers ต่อฟังก์ชัน; ถ้าเกิน executor จะ compile ไม่ผ่านและเมนูไม่ขึ้น)
+local Rec = {}
+
+function Rec.roundedPosition(position)
     return math.floor(position.X + 0.5), math.floor(position.Y + 0.5)
 end
 
-local function removeRecordedEvent(events, target)
+function Rec.removeRecordedEvent(events, target)
     if type(events) ~= "table" or not target then
         return false
     end
@@ -5934,7 +5954,7 @@ local function removeRecordedEvent(events, target)
     return false
 end
 
-local function unregisterWorldTarget(held)
+function Rec.unregisterWorldTarget(held)
     if not held or not held.worldId then
         return
     end
@@ -5949,7 +5969,7 @@ local function unregisterWorldTarget(held)
     end
 end
 
-local function updateHeldMouseDistance(held, position)
+function Rec.updateHeldMouseDistance(held, position)
     if not held then
         return 0
     end
@@ -5965,11 +5985,11 @@ local function updateHeldMouseDistance(held, position)
     return held.maxDistance or 0
 end
 
-local function shouldDropHeldClick(held, position)
+function Rec.shouldDropHeldClick(held, position)
     if not held or Settings.recordMotion then
         return false
     end
-    local distance = updateHeldMouseDistance(held, position)
+    local distance = Rec.updateHeldMouseDistance(held, position)
     if held.button == "Right" then
         return distance > MOUSE_DRAG_THRESHOLD
     end
@@ -5979,7 +5999,7 @@ local function shouldDropHeldClick(held, position)
     return false
 end
 
-local function closeRecordingInputs(events, endTime)
+function Rec.closeRecordingInputs(events, endTime)
     if type(events) ~= "table" then
         return
     end
@@ -5987,7 +6007,7 @@ local function closeRecordingInputs(events, endTime)
     local position = getMousePosition()
     local fallbackX, fallbackY = 0, 0
     if position then
-        fallbackX, fallbackY = roundedPosition(position)
+        fallbackX, fallbackY = Rec.roundedPosition(position)
     elseif Input.point then
         fallbackX, fallbackY = math.floor(Input.point.X), math.floor(Input.point.Y)
     end
@@ -6002,11 +6022,11 @@ local function closeRecordingInputs(events, endTime)
             heldPosition = held.startPosition
         end
 
-        if shouldDropHeldClick(held, heldPosition) then
-            removeRecordedEvent(events, held.downEvent)
-            unregisterWorldTarget(held)
+        if Rec.shouldDropHeldClick(held, heldPosition) then
+            Rec.removeRecordedEvent(events, held.downEvent)
+            Rec.unregisterWorldTarget(held)
         elseif heldPosition then
-            local x, y = roundedPosition(heldPosition)
+            local x, y = Rec.roundedPosition(heldPosition)
             table.insert(events, {
                 t = endTime,
                 type = "mouseUp",
@@ -6060,7 +6080,7 @@ local function closeRecordingInputs(events, endTime)
     State.recordingKeys = {}
 end
 
-local function warnUnsupportedKey(keyName)
+function Rec.warnUnsupportedKey(keyName)
     if App.warnedKeys[keyName] then
         return
     end
@@ -6068,7 +6088,7 @@ local function warnUnsupportedKey(keyName)
     Log.add("warn", "ไม่รองรับปุ่ม " .. tostring(keyName) .. " — ปุ่มนี้จะไม่ถูกบันทึก")
 end
 
-local function updateRecordInfo()
+function Rec.updateRecordInfo()
     if not UI.refs.recordInfo then
         return
     end
@@ -6104,7 +6124,7 @@ local function updateRecordInfo()
     end
 end
 
-local function updateMetaFromEvents(meta, events)
+function Rec.updateMetaFromEvents(meta, events)
     if not meta then
         return
     end
@@ -6113,7 +6133,7 @@ local function updateMetaFromEvents(meta, events)
     meta.modified = os.time()
 end
 
-local function ensureProfileForRecording()
+function Rec.ensureProfileForRecording()
     local meta = selectedProfileMeta()
     if meta and Profiles.data and Profiles.data.id == meta.id then
         return meta
@@ -6172,7 +6192,7 @@ local function ensureProfileForRecording()
     return meta
 end
 
-local function captureAdapterSet()
+function Rec.captureAdapterSet()
     if not App.gameAdapter or not adapterSupports("captureSet") then
         return
     end
@@ -6219,7 +6239,7 @@ local function captureAdapterSet()
     end
 end
 
-local function buildInferredSet(events)
+function Rec.buildInferredSet(events)
     local keys = {}
     local keyCount = 0
     local clicks = {}
@@ -6281,7 +6301,7 @@ local function buildInferredSet(events)
     }
 end
 
-local function makePendingRecording(events, set, screen)
+function Rec.makePendingRecording(events, set, screen)
     local meta = selectedProfileMeta()
     return {
         events = events,
@@ -6294,7 +6314,7 @@ local function makePendingRecording(events, set, screen)
     }
 end
 
-local function addRecordedEvent(event)
+function Rec.addRecordedEvent(event)
     if State.mode ~= "recording" then
         return
     end
@@ -6307,16 +6327,16 @@ local function addRecordedEvent(event)
     table.insert(State.events, event)
 end
 
-local function writeLiveRecovery()
+function Rec.writeLiveRecovery()
     if not Settings.autosave or State.mode ~= "recording" or #State.events == 0 then
         return
     end
-    local set = buildInferredSet(State.events)
-    local pending = makePendingRecording(State.events, set, State.recordViewport)
+    local set = Rec.buildInferredSet(State.events)
+    local pending = Rec.makePendingRecording(State.events, set, State.recordViewport)
     Recovery.write(pending)
 end
 
-local function startRecordingNow()
+function Rec.startRecordingNow()
     State.token += 1
     local token = State.token
     State.mode = "countdown"
@@ -6346,7 +6366,7 @@ local function startRecordingNow()
     State.selectedSteps = {}
     setStatus("เตรียมบันทึก 3...", "warn")
     App.refreshTransport()
-    updateRecordInfo()
+    Rec.updateRecordInfo()
 
     local meta = selectedProfileMeta()
     Log.add("info", "เตรียมบันทึก: " .. (meta and meta.name or "ไม่มีโปรไฟล์"))
@@ -6386,18 +6406,18 @@ local function startRecordingNow()
             Settings.recordMovementKeys and "on" or "off",
             Settings.worldAnchor and "on" or "off"
         ))
-        if Settings.worldAnchor and pointOverGameGui(-1, -1) then
+        if Settings.worldAnchor and GuiTargeting.pointOverGameGui(-1, -1) then
             Log.add("warn", "ตรวจ UI เกมไม่ได้หรือมี GUI บังจุดทดสอบ — world anchor อาจถูกข้ามเพื่อความปลอดภัย")
         end
 
         local position = getMousePosition()
         if Settings.recordMotion and position and not pointInGui(position) then
-            local x, y = roundedPosition(position)
+            local x, y = Rec.roundedPosition(position)
             State.lastRecordedMove = position
-            addRecordedEvent({ type = "mouseMove", x = x, y = y })
+            Rec.addRecordedEvent({ type = "mouseMove", x = x, y = y })
         end
-        captureAdapterSet()
-        updateRecordInfo()
+        Rec.captureAdapterSet()
+        Rec.updateRecordInfo()
     end)
 end
 
@@ -6425,15 +6445,15 @@ function App.requestStartRecording()
             "เริ่มบันทึกใหม่",
             function()
                 Recovery.clear()
-                ensureProfileForRecording()
-                startRecordingNow()
+                Rec.ensureProfileForRecording()
+                Rec.startRecordingNow()
             end,
             true
         )
         return
     end
-    ensureProfileForRecording()
-    startRecordingNow()
+    Rec.ensureProfileForRecording()
+    Rec.startRecordingNow()
 end
 
 function App.saveCurrentProfile(silent)
@@ -6457,7 +6477,7 @@ function App.saveCurrentProfile(silent)
         Log.add("error", "บันทึกไฟล์โปรไฟล์ไม่สำเร็จ: " .. tostring(err))
         return false
     end
-    updateMetaFromEvents(meta, Profiles.events)
+    Rec.updateMetaFromEvents(meta, Profiles.events)
     State.dirty = false
     saveIndex()
     if not silent then
@@ -6596,7 +6616,7 @@ function App.openMacroNameDialog(pending, suggestedName)
                 setStatus("ทิ้งข้อมูลบันทึกแล้ว", "warn")
                 Log.add("warn", "ผู้ใช้ทิ้งข้อมูลบันทึกที่ยังไม่ตั้งชื่อ")
                 App.refreshProfiles()
-                updateRecordInfo()
+                Rec.updateRecordInfo()
             end,
             true,
             function()
@@ -6615,7 +6635,7 @@ function App.openMacroNameDialog(pending, suggestedName)
     end)
 end
 
-local function resolvePendingProfile(pending)
+function Rec.resolvePendingProfile(pending)
     if Profiles.data and pending.profileId and Profiles.data.id == pending.profileId then
         return selectedProfileMeta(), Profiles.data
     end
@@ -6678,7 +6698,7 @@ function App.commitPendingRecording(pending, name, overwriteId)
     if not pending or not name then
         return false
     end
-    local meta, data = resolvePendingProfile(pending)
+    local meta, data = Rec.resolvePendingProfile(pending)
     if not meta or not data then
         showNotice("บันทึกไม่สำเร็จ", "ไม่สามารถเตรียมโปรไฟล์สำหรับบันทึกได้")
         return false
@@ -6741,7 +6761,7 @@ function App.commitPendingRecording(pending, name, overwriteId)
     State.finished = false
     Recovery.clear()
     saveIndex()
-    updateMetaFromEvents(meta, target.events)
+    Rec.updateMetaFromEvents(meta, target.events)
     setStatus("บันทึก Macro แล้ว", "ready")
     Log.add("success", string.format(
         "บันทึก Macro \"%s\" • %d ขั้นตอน • %s • เซ็ต %s",
@@ -6751,7 +6771,7 @@ function App.commitPendingRecording(pending, name, overwriteId)
         target.set and target.set.status or "ไม่มี"
     ))
     App.refreshProfiles()
-    updateRecordInfo()
+    Rec.updateRecordInfo()
     return true
 end
 
@@ -6768,7 +6788,7 @@ function App.stopRecording()
         setStatus("ยกเลิกการบันทึก", "warn")
         Log.add("info", "ยกเลิกการบันทึก")
         App.refreshTransport()
-        updateRecordInfo()
+        Rec.updateRecordInfo()
         return
     end
 
@@ -6778,7 +6798,7 @@ function App.stopRecording()
 
     local events = State.events
     local endTime = math.max(0, clock() - State.recordStart)
-    closeRecordingInputs(events, endTime)
+    Rec.closeRecordingInputs(events, endTime)
     State.token += 1
     State.mode = "idle"
     State.events = {}
@@ -6793,12 +6813,12 @@ function App.stopRecording()
         setStatus("ไม่ได้บันทึกขั้นตอน", "warn")
         Log.add("warn", "หยุดบันทึกแต่ไม่มีขั้นตอนใดถูกบันทึก")
         App.refreshTransport()
-        updateRecordInfo()
+        Rec.updateRecordInfo()
         return
     end
 
-    local set = buildInferredSet(events)
-    local pending = makePendingRecording(events, set, State.recordViewport)
+    local set = Rec.buildInferredSet(events)
+    local pending = Rec.makePendingRecording(events, set, State.recordViewport)
     State.pendingRecording = pending
     Recovery.write(pending)
 
@@ -6839,7 +6859,7 @@ function App.stopRecording()
         set.status
     ))
     App.refreshProfiles()
-    updateRecordInfo()
+    Rec.updateRecordInfo()
     if not State.menuVisible then
         setMenuVisible(true)
     end
@@ -6896,7 +6916,7 @@ function App.emergencyStop()
     end
     Log.add("warn", "หยุดฉุกเฉิน (F8): หยุดงานและปิด AFK • ข้อมูลที่ยังไม่ตั้งชื่อถูกเก็บไว้")
     App.updateAfkUI()
-    updateRecordInfo()
+    Rec.updateRecordInfo()
 end
 
 function App.promptDeleteRecovery()
@@ -6983,7 +7003,7 @@ function App.promptRecovery()
         setStatus("รอตั้งชื่อ Macro ที่กู้คืน", "warn")
         Log.add("info", "กู้คืนข้อมูลบันทึก: " .. tostring(#pending.events) .. " ขั้นตอน")
         App.refreshProfiles()
-        updateRecordInfo()
+        Rec.updateRecordInfo()
         App.openMacroNameDialog(pending)
     end, { width = 88 })
 end
@@ -7042,7 +7062,7 @@ local function connectInputHandlers()
             end
             if not State.recordingMouse[button] then
                 local source = input.UserInputType == Enum.UserInputType.Touch and "touch" or "mouse"
-                local x, y = roundedPosition(position)
+                local x, y = Rec.roundedPosition(position)
                 local world = nil
                 local worldId = nil
                 local gui = nil
@@ -7050,7 +7070,7 @@ local function connectInputHandlers()
                 local guiUnknown = false
                 if button == "Left" then
                     local guiOk, guiTarget, guiReason = pcall(function()
-                        return captureGuiTarget(position.X, position.Y)
+                        return GuiTargeting.captureGuiTarget(position.X, position.Y)
                     end)
                     if not guiOk then
                         guiUnknown = true
@@ -7062,13 +7082,13 @@ local function connectInputHandlers()
                         return
                     elseif guiTarget then
                         gui = guiTarget
-                        selection = bindUpgradeSelection(guiTarget)
+                        selection = GuiTargeting.bindUpgradeSelection(guiTarget)
                         if not selection then
                             -- คลิก GUI อื่นที่ไม่ใช่ปุ่มอัปเกรดอาจเปลี่ยนยูนิตที่เลือก
                             -- ล้างเป้าอัปเกรดเดิมเพื่อไม่ให้ผูกผิดตัว
                             State.lastWorldSelection = nil
                         end
-                    elseif pointOverGameGui(position.X, position.Y) then
+                    elseif GuiTargeting.pointOverGameGui(position.X, position.Y) then
                         guiUnknown = true
                     elseif Settings.worldAnchor then
                         local anchorOk, anchor = pcall(function()
@@ -7113,7 +7133,7 @@ local function connectInputHandlers()
                     downEvent = downEvent,
                 }
                 State.lastRecordedMove = position
-                addRecordedEvent(downEvent)
+                Rec.addRecordedEvent(downEvent)
                 if world and State.mode == "recording" then
                     local target = {
                         id = worldId,
@@ -7124,7 +7144,7 @@ local function connectInputHandlers()
                     State.worldTargets = State.worldTargets or {}
                     State.worldTargets[worldId] = target
                     State.lastWorldTarget = target
-                    if isLikelySelectionWorld(world) then
+                    if GuiTargeting.isLikelySelectionWorld(world) then
                         State.lastWorldSelection = target
                     else
                         -- คลิกพื้น/โซนวางไม่ควรคงยูนิตที่เลือกไว้ก่อนหน้าเป็นเป้าอัปเกรด
@@ -7141,17 +7161,17 @@ local function connectInputHandlers()
                     if not State.recordingKeys[keyName] then
                         if Settings.recordMovementKeys or not isMovementKeyName(keyName) then
                             State.recordingKeys[keyName] = { vk = vk }
-                            addRecordedEvent({ type = "keyDown", key = keyName, vk = vk })
+                            Rec.addRecordedEvent({ type = "keyDown", key = keyName, vk = vk })
                         else
                             State.recordingKeys[keyName] = { vk = vk, filtered = true }
                         end
                     end
                 else
-                    warnUnsupportedKey(keyName)
+                    Rec.warnUnsupportedKey(keyName)
                 end
             end
         end
-        updateRecordInfo()
+        Rec.updateRecordInfo()
     end)
 
     connectTracked(UserInputService.InputEnded, function(input)
@@ -7173,15 +7193,15 @@ local function connectInputHandlers()
             if held then
                 State.recordingMouse[button] = nil
                 local position = inputPosition(input) or held.lastPosition
-                updateHeldMouseDistance(held, position)
-                if shouldDropHeldClick(held, position) then
-                    removeRecordedEvent(State.events, held.downEvent)
-                    unregisterWorldTarget(held)
+                Rec.updateHeldMouseDistance(held, position)
+                if Rec.shouldDropHeldClick(held, position) then
+                    Rec.removeRecordedEvent(State.events, held.downEvent)
+                    Rec.unregisterWorldTarget(held)
                 else
                     local finalPosition = position or held.startPosition or held.lastPosition
                     if finalPosition then
-                        local x, y = roundedPosition(finalPosition)
-                        addRecordedEvent({
+                        local x, y = Rec.roundedPosition(finalPosition)
+                        Rec.addRecordedEvent({
                             type = "mouseUp",
                             button = button,
                             x = x,
@@ -7207,12 +7227,12 @@ local function connectInputHandlers()
                 if held then
                     State.recordingKeys[keyName] = nil
                     if not held.filtered then
-                        addRecordedEvent({ type = "keyUp", key = keyName, vk = held.vk or VK_BY_NAME[keyName] })
+                        Rec.addRecordedEvent({ type = "keyUp", key = keyName, vk = held.vk or VK_BY_NAME[keyName] })
                     end
                 end
             end
         end
-        updateRecordInfo()
+        Rec.updateRecordInfo()
     end)
 
     connectTracked(UserInputService.InputChanged, function(input)
@@ -7248,7 +7268,7 @@ local function connectInputHandlers()
             end
             local amount = input.Position.Z
             if amount and amount ~= 0 then
-                addRecordedEvent({ type = "wheel", z = amount })
+                Rec.addRecordedEvent({ type = "wheel", z = amount })
             end
             return
         end
@@ -7262,7 +7282,7 @@ local function connectInputHandlers()
             local isTouch = input.UserInputType == Enum.UserInputType.Touch
             for _, held in pairs(State.recordingMouse) do
                 if (held.source == "touch") == isTouch then
-                    updateHeldMouseDistance(held, position)
+                    Rec.updateHeldMouseDistance(held, position)
                 end
             end
             if pointInGui(position) then
@@ -7278,9 +7298,9 @@ local function connectInputHandlers()
             State.lastMoveSample = now
             local last = State.lastRecordedMove
             if not last or (position - last).Magnitude >= 2 then
-                local x, y = roundedPosition(position)
+                local x, y = Rec.roundedPosition(position)
                 State.lastRecordedMove = position
-                addRecordedEvent({ type = "mouseMove", x = x, y = y })
+                Rec.addRecordedEvent({ type = "mouseMove", x = x, y = y })
             end
         end
     end)
@@ -7292,7 +7312,7 @@ local function connectInputHandlers()
                 local now = clock()
                 if now - lastInfoUpdate >= 0.2 then
                     lastInfoUpdate = now
-                    updateRecordInfo()
+                    Rec.updateRecordInfo()
                 end
             end
             return
@@ -7303,7 +7323,7 @@ local function connectInputHandlers()
         if pointerPosition then
             for _, held in pairs(State.recordingMouse) do
                 if held.source ~= "touch" then
-                    updateHeldMouseDistance(held, pointerPosition)
+                    Rec.updateHeldMouseDistance(held, pointerPosition)
                 end
             end
         end
@@ -7314,9 +7334,9 @@ local function connectInputHandlers()
                 if mouseHeld or not pointInGui(pointerPosition) then
                     local last = State.lastRecordedMove
                     if not last or (pointerPosition - last).Magnitude >= 2 then
-                        local x, y = roundedPosition(pointerPosition)
+                        local x, y = Rec.roundedPosition(pointerPosition)
                         State.lastRecordedMove = pointerPosition
-                        addRecordedEvent({ type = "mouseMove", x = x, y = y })
+                        Rec.addRecordedEvent({ type = "mouseMove", x = x, y = y })
                     end
                 end
             end
@@ -7325,7 +7345,7 @@ local function connectInputHandlers()
         if App.gameAdapter and adapterSupports("captureSet") then
             if now - (State.lastSetSample or 0) >= 2 then
                 State.lastSetSample = now
-                captureAdapterSet()
+                Rec.captureAdapterSet()
             end
         end
 
@@ -7355,7 +7375,7 @@ local function connectInputHandlers()
 
         if now - (State.lastRecoveryWrite or 0) >= RECOVERY_SNAPSHOT_SECONDS then
             State.lastRecoveryWrite = now
-            local recoveryOk, recoveryError = pcall(writeLiveRecovery)
+            local recoveryOk, recoveryError = pcall(Rec.writeLiveRecovery)
             if not recoveryOk and not State.recoveryWarned then
                 State.recoveryWarned = true
                 Log.add("warn", "บันทึก recovery ระหว่างบันทึกไม่สำเร็จ: " .. tostring(recoveryError))
@@ -7364,7 +7384,7 @@ local function connectInputHandlers()
 
         if now - lastInfoUpdate >= 0.2 then
             lastInfoUpdate = now
-            updateRecordInfo()
+            Rec.updateRecordInfo()
         end
     end)
 end
@@ -7794,7 +7814,7 @@ local function resolveWorldEventPoint(event)
     if pointInGui(Vector2.new(x, y)) then
         return nil, nil, nil, "own"
     end
-    local target, _, checked, ownBlocked = guiTargetAt(x, y)
+    local target, _, checked, ownBlocked = GuiTargeting.guiTargetAt(x, y)
     if ownBlocked then
         return nil, nil, nil, "own"
     end
@@ -7812,7 +7832,7 @@ local function resolveWorldEventPoint(event)
 end
 
 local function resolveGuiEventPoint(event)
-    local first, second, third = resolveGuiTargetPoint(event.gui)
+    local first, second, third = GuiTargeting.resolveGuiTargetPoint(event.gui)
     if first then
         return first, second
     end
@@ -7902,7 +7922,7 @@ local function confirmSelectionTarget(selection)
         end
         return true, nil, "own"
     end
-    local target, _, checked, ownBlocked = guiTargetAt(x, y)
+    local target, _, checked, ownBlocked = GuiTargeting.guiTargetAt(x, y)
     if ownBlocked then
         if State.lastSyntheticWorldId == selection.worldId then
             return true
@@ -8013,7 +8033,7 @@ local function applyEvent(event)
                     error("หยุดระหว่างกดเมาส์")
                 end
             end
-            if mode == "world" and event.worldId and isLikelySelectionWorld(event.world) then
+            if mode == "world" and event.worldId and GuiTargeting.isLikelySelectionWorld(event.world) then
                 State.lastSyntheticWorldId = event.worldId
             elseif not event.selection then
                 -- คลิกอื่นที่ไม่ใช่ปุ่มอัปเกรดที่ผูกยูนิตอาจเปลี่ยน/ยกเลิกการเลือก
@@ -8444,7 +8464,7 @@ function App.startPlayback(options)
             end
             if event.selection then
                 upgradeTargetCount += 1
-            elseif event.gui and isLikelyUpgradeGui(event.gui) then
+            elseif event.gui and GuiTargeting.isLikelyUpgradeGui(event.gui) then
                 unboundUpgradeCount += 1
             end
             if event.guiUnknown then
@@ -8705,7 +8725,7 @@ function App.selectProfile(id, silent, force)
 
     saveIndex()
     App.refreshProfiles()
-    updateRecordInfo()
+    Rec.updateRecordInfo()
     if not silent then
         Log.add("info", "เลือกโปรไฟล์: " .. meta.name .. (macro and (" / " .. macro.name) or ""))
     end
@@ -8745,7 +8765,7 @@ function App.selectMacro(id, silent)
         persistProfile(meta, Profiles.events, "เลือก Macro")
     end
     App.refreshProfiles()
-    updateRecordInfo()
+    Rec.updateRecordInfo()
     if not silent then
         Log.add("info", "เลือก Macro: " .. macro.name)
     end
@@ -8792,7 +8812,7 @@ function App.promptCreateProfile(force)
             State.dirty = false
             persistProfile(meta, {}, "สร้างโปรไฟล์")
             App.refreshProfiles()
-            updateRecordInfo()
+            Rec.updateRecordInfo()
             Log.add("success", "สร้างโปรไฟล์: " .. meta.name)
         end
     )
@@ -8892,7 +8912,7 @@ function App.promptDeleteProfile()
             end
             saveIndex()
             App.refreshProfiles()
-            updateRecordInfo()
+            Rec.updateRecordInfo()
             Log.add("success", "ลบโปรไฟล์: " .. meta.name)
         end,
         true
@@ -9010,7 +9030,7 @@ function App.promptDeleteMacro()
             State.stepMacroId = nil
             persistProfile(meta, Profiles.events, "ลบ Macro")
             App.refreshProfiles()
-            updateRecordInfo()
+            Rec.updateRecordInfo()
             Log.add("success", "ลบ Macro: " .. macro.name)
         end,
         true
@@ -9070,7 +9090,7 @@ function App.promptDeleteSelectedSteps()
             State.finished = false
             persistProfile(meta, Profiles.events, "ลบขั้นตอน")
             App.refreshProfiles()
-            updateRecordInfo()
+            Rec.updateRecordInfo()
             Log.add("success", string.format("ลบ %d ขั้นตอนจาก Macro \"%s\" • เหลือ %d", removedCount, macro.name, #macro.events))
         end,
         true
@@ -9115,7 +9135,7 @@ function App.promptResetMacro()
             State.finished = false
             persistProfile(meta, Profiles.events, "Reset Macro")
             App.refreshProfiles()
-            updateRecordInfo()
+            Rec.updateRecordInfo()
             Log.add("success", "Reset Macro: " .. macro.name .. " (ล้างเฉพาะ Macro นี้)")
         end,
         true
@@ -9373,7 +9393,7 @@ function App.importProfileText(text)
 
     saveIndex()
     App.refreshProfiles()
-    updateRecordInfo()
+    Rec.updateRecordInfo()
     Log.add("success", string.format(
         "นำเข้าโปรไฟล์: %s • %d Macro • %d ขั้นตอน",
         meta.name,
@@ -9797,8 +9817,8 @@ function App.destroy()
 
     -- เก็บข้อมูลที่ยังไม่ตั้งชื่อก่อนปิด เพื่อให้เปิดสคริปต์ใหม่แล้วกู้คืนได้
     if State.mode == "recording" and #State.events > 0 then
-        local set = buildInferredSet(State.events)
-        Recovery.write(makePendingRecording(State.events, set, State.recordViewport))
+        local set = Rec.buildInferredSet(State.events)
+        Recovery.write(Rec.makePendingRecording(State.events, set, State.recordViewport))
     elseif State.pendingRecording then
         Recovery.write(State.pendingRecording)
     end
@@ -9871,6 +9891,12 @@ end
 -- ============================================================================
 
 detectCapabilities()
+print(string.format(
+    "[ASTD Macro] Bootstrap 2/5: ตรวจสอบ Executor แล้ว (%s %s • %s)",
+    tostring(Cap.executorName),
+    tostring(Cap.executorVersion),
+    tostring(Cap.platform)
+))
 Input.init()
 
 local foldersOk, foldersError = ensureWorkspaceFolders()
@@ -9888,6 +9914,11 @@ end
 
 loadSettings()
 loadProfiles()
+Log.add("info", string.format(
+    "Bootstrap 3/5: โหลดตั้งค่า/โปรไฟล์แล้ว (%d โปรไฟล์) • files %s",
+    #Profiles.list,
+    App.apiStatus.files and "พร้อม" or "จำกัด"
+))
 
 if not Profiles.selectedId and #Profiles.list > 0 then
     Profiles.selectedId = Profiles.list[1].id
@@ -9925,6 +9956,7 @@ elseif Profiles.data then
     Profiles.selectedId = Profiles.data.id
 end
 
+Log.add("info", "Bootstrap 4/5: กำลังสร้าง GUI...")
 local uiCallOk, uiOk, uiError = pcall(buildUI)
 if not uiCallOk then
     uiError = uiOk
@@ -9941,6 +9973,7 @@ if not uiOk then
     return
 end
 
+Log.add("info", "Bootstrap 4/5: สร้าง GUI สำเร็จ (" .. tostring(App.apiStatus.gui) .. ")")
 connectInputHandlers()
 
 local localPlayer = Players.LocalPlayer
@@ -9979,7 +10012,7 @@ end)
 App.refreshProfiles()
 App.refreshSettingsUI()
 App.refreshTransport()
-updateRecordInfo()
+Rec.updateRecordInfo()
 
 if Cap.input == "none" then
     setStatus("ไม่พบ API อินพุต", "error")
@@ -10034,4 +10067,4 @@ task.delay(0.5, function()
 end)
 
 GENV.__ASTD_MACRO = RuntimeHandle
-print(string.format("[%s] โหลดสำเร็จ — F7 ซ่อน/แสดงเมนู, F8 หยุดฉุกเฉิน", APP_NAME))
+Log.add("info", "Bootstrap 5/5: พร้อมใช้งาน — F7 ซ่อน/แสดงเมนู, F8 หยุดฉุกเฉิน")
