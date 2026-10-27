@@ -5669,7 +5669,7 @@ local function buildUI()
         UI.refs.afkStopButton = makeButton(body, "หยุดระบบ AFK", UDim2.new(1, 0, 0, 32), Theme.panel3, function()
             App.setAfkEnabled(false)
         end, { textSize = 11 })
-        makeWrappedLabel(body, "ขยับเมาส์เล็กน้อยทุก 5 นาทีเมื่อหน้าต่างเกม active และ Macro ว่าง • ไม่รับประกันว่าจะไม่ถูก kick • VirtualUser backend ไม่รองรับ AFK", 10, Theme.muted, 42)
+        makeWrappedLabel(body, "ขยับเมาส์เสมือนเล็กน้อยทุก 5 นาทีเมื่อหน้าต่างเกม active และ Macro ว่าง • VirtualInput/VIM รองรับ • VirtualUser backend ไม่รองรับ AFK", 10, Theme.muted, 42)
     end
 
     do
@@ -10823,7 +10823,7 @@ function App.setAfkEnabled(value)
         App.updateAfkUI()
         showNotice(
             "AFK Guard ไม่พร้อม",
-            "backend นี้ไม่มี mousemoverel ที่ปลอดภัย จึงเปิด AFK Guard ไม่ได้\n" .. tostring(Cap.inputDetail)
+            "backend อินพุตนี้ยังไม่รองรับการกัน AFK อย่างปลอดภัย\n" .. tostring(Cap.inputDetail)
         )
         return
     end
