@@ -2445,6 +2445,10 @@ local function demoteToVim(reason)
 end
 
 function Input.init()
+    -- ต้องรีเซ็ต backend เดิมก่อนทุกครั้ง ไม่งั้นการปิด noMouseMove ระหว่างใช้งาน
+    -- จะค้าง backend เป็น virtualinput ที่ object ถูก nil ไปแล้ว
+    Input.backend = "none"
+    Input.ready = false
     Input.virtualInput = nil
     Input.vim = nil
     Input.virtualUser = Cap.virtualUser
@@ -2477,6 +2481,10 @@ function Input.init()
     if Input.backend == "none" then
         if Cap.realReady then
             Input.backend = "real"
+        elseif Cap.vim then
+            -- ไม่มี API เมาส์ของ executor แต่ VIM ยังใช้ได้: ดีกว่าไปใช้ VirtualUser
+            Input.vim = Cap.vim
+            Input.backend = "vim"
         elseif Cap.virtualReady then
             Input.backend = "virtual"
         end
@@ -2798,6 +2806,15 @@ function Input.scroll(amount)
     amount = numberOr(amount, 0)
     if type(mousescroll) == "function" then
         local ok, err = pcall(mousescroll, amount)
+        if not ok then
+            Input.lastError = tostring(err)
+            return false, tostring(err)
+        end
+        return true
+    elseif Input.backend == "virtualinput" and Input.virtualInput then
+        local ok, err = pcall(function()
+            Input.virtualInput:SendPointerAction(Input.point, { Wheel = amount })
+        end)
         if not ok then
             Input.lastError = tostring(err)
             return false, tostring(err)
@@ -5629,10 +5646,9 @@ local function buildUI()
             saveSettings()
         end)
 
-        UI.refs.autoHideToggle = makeToggleRow(body, "ซ่อนเมนูเมื่อเริ่มเล่น/บันทึก", Settings.autoHide, "งานเบื้องหลังไม่หยุด; ใช้ dock เพื่อเปิดเมนู/หยุด • บนมือถือซ่อนอัตโนมัติเพื่อไม่ให้ GUI บังเกม", function(value)
-            Settings.autoHide = value
-            saveSettings()
-        end)
+        -- เมนูหลักบังจุดคลิกเกือบทั้งจอ จึงต้องซ่อนระหว่างเล่น/บันทึกเสมอ
+        -- เปลี่ยนจาก toggle เป็นแถวข้อมูลเพื่อไม่ให้ผู้ใช้เข้าใจว่าปิดได้
+        UI.refs.autoHideInfo = makeInfoRow(body, "ซ่อนเมนูระหว่างเล่น/บันทึก", "บังคับเปิด")
 
         UI.refs.recordMotionToggle = makeToggleRow(body, "บันทึกการขยับเมาส์/กล้อง", Settings.recordMotion, "ปิดเป็นค่าเริ่มต้น • เปิดเฉพาะเมื่อจำเป็น เพราะการเล่นซ้ำอาจเลื่อนเมาส์หรือหมุนกล้อง", function(value)
             Settings.recordMotion = value
@@ -6646,9 +6662,6 @@ function App.refreshSettingsUI()
     if UI.refs.autosaveToggle then
         UI.refs.autosaveToggle.set(Settings.autosave, false)
     end
-    if UI.refs.autoHideToggle then
-        UI.refs.autoHideToggle.set(Settings.autoHide, false)
-    end
     if UI.refs.recordMotionToggle then
         UI.refs.recordMotionToggle.set(Settings.recordMotion == true, false)
     end
@@ -6756,6 +6769,18 @@ local function pointInGui(position)
         end
     end
     return false
+end
+
+-- Dock ของสคริปต์ลอยอยู่กลางด้านบนและบังคลิกได้ ต้องซ่อนชั่วคราวเฉพาะตอนส่งคลิก
+local function pointInDock(x, y)
+    local dock = UI.dock
+    if not dock or not dock.Visible or type(x) ~= "number" or type(y) ~= "number" then
+        return false
+    end
+    local origin = dock.AbsolutePosition
+    local size = dock.AbsoluteSize
+    return x >= origin.X - 2 and x <= origin.X + size.X + 2
+        and y >= origin.Y - 2 and y <= origin.Y + size.Y + 2
 end
 
 -- UI ของเกม (ช่องเลือกตัวละคร ปุ่มอัปเกรด จอยมือถือ) อยู่กับที่บนหน้าจอ
@@ -6939,6 +6964,37 @@ local function buildGuiTarget(object, entry, x, y)
     }, object
 end
 
+-- GetGuiObjectsAtPosition อาจคืนลูกของ Frame ที่ซ่อนอยู่ (แล้วแต่เวอร์ชัน)
+-- จึงเดินเช็ค Visible/Enabled ของทุกชั้น ไม่งั้นเมนูที่ซ่อนแล้วจะยังบล็อกคลิก
+local function guiObjectVisible(object)
+    local node = object
+    local depth = 0
+    while node and depth < 32 do
+        local visible = true
+        local enabled = true
+        local isGuiObject = false
+        local isLayerCollector = false
+        pcall(function()
+            isGuiObject = node:IsA("GuiObject")
+            isLayerCollector = node:IsA("LayerCollector")
+            if isGuiObject then
+                visible = node.Visible ~= false
+            elseif isLayerCollector then
+                enabled = node.Enabled ~= false
+            end
+        end)
+        if not visible or not enabled then
+            return false
+        end
+        if isLayerCollector then
+            break
+        end
+        node = node.Parent
+        depth += 1
+    end
+    return true
+end
+
 local function guiTargetAt(x, y)
     x = numberOr(x, 0)
     y = numberOr(y, 0)
@@ -6949,12 +7005,7 @@ local function guiTargetAt(x, y)
     local objects, checked = guiObjectsAt(x, y)
     for _, object in ipairs(objects) do
         if object then
-            -- ถ้าอ่าน Visible ไม่ได้ ให้ถือว่ามองเห็นไว้ก่อนเพื่อความปลอดภัย
-            local visible = true
-            pcall(function()
-                visible = object.Visible ~= false
-            end)
-            if visible then
+            if guiObjectVisible(object) then
                 if isOwnGuiObject(object) then
                     return nil, nil, checked, true
                 end
@@ -7714,10 +7765,12 @@ function Rec.startRecordingNow()
         State.lastStageSample = 0
         State.stageWarned = false
 
-        -- บนมือถือเมนูเต็มจอจะบังอินพุตเกม จึงต้องซ่อนก่อนเริ่มเก็บเหตุการณ์
-        if State.menuVisible and (Settings.autoHide or Cap.mobile) then
+        -- ต้องซ่อนเมนูก่อนเริ่มเก็บเหตุการณ์เสมอ เพราะเมนูหลักบังจุดคลิกเกือบทั้งจอ
+        -- และคลิกที่โดนเมนูบังจะไม่ถูกบันทึก (เดิมพึ่ง autoHide)
+        if State.menuVisible then
             setMenuVisible(false)
             State.autoHidden = true
+            Log.add("info", "ซ่อนเมนูระหว่างบันทึกเพื่อไม่ให้บังการเก็บคลิก")
         end
 
         setStatus("กำลังบันทึก", "recording")
@@ -9327,6 +9380,38 @@ local function confirmSelectionTarget(selection)
 end
 
 local function applyEvent(event)
+    -- Dock ลอยอยู่กลางด้านบนและอาจทับจุดคลิก: ซ่อนเฉพาะตอนส่ง mouseDown/mouseUp
+    local hideDock = false
+    if (event.type == "mouseDown" or event.type == "mouseUp") and UI.dock and UI.dock.Visible then
+        local px, py = scaledPoint(event)
+        if pointInDock(px, py) then
+            hideDock = true
+        end
+        if not hideDock and Settings.worldAnchor == true and event.world then
+            local wx, wy = projectWorldPoint(event.world)
+            if wx and pointInDock(wx, wy) then
+                hideDock = true
+            end
+        end
+        if not hideDock and Settings.worldAnchor == true
+            and event.selection and event.selection.world then
+            local sx, sy = projectWorldPoint(event.selection.world)
+            if sx and pointInDock(sx, sy) then
+                hideDock = true
+            end
+        end
+        if not hideDock and event.gui then
+            -- GUI ที่บันทึกไว้อาจถูกย้ายตำแหน่งมาอยู่ใต้ dock ในรอบนี้
+            local resolved, gx, gy = pcall(GuiTargeting.resolveGuiTargetPoint, event.gui)
+            if resolved and gx and pointInDock(gx, gy) then
+                hideDock = true
+            end
+        end
+    end
+    if hideDock then
+        UI.dock.Visible = false
+    end
+
     local ok, err = pcall(function()
         if event.type == "mouseMove" then
             local x, y, mode, skip, resolveError = resolveEventPoint(event)
@@ -9478,6 +9563,15 @@ local function applyEvent(event)
             error("ชนิดเหตุการณ์ไม่รองรับ: " .. tostring(event.type))
         end
     end)
+
+    if hideDock and UI.dock and UI.main and not UI.main.Visible then
+        -- รอหนึ่งเฟรมให้เกมประมวลผลอินพุตก่อนแล้วจึงคืน dock
+        -- ถ้าคืนทันที dock อาจกลับมาบังคลิกก่อนเกมรับ event
+        task.wait()
+        if UI.dock and UI.main and not UI.main.Visible then
+            UI.dock.Visible = true
+        end
+    end
 
     if not ok then
         return false, tostring(err)
@@ -9912,11 +10006,12 @@ function App.startPlayback(options)
             setStatus("กำลังเล่น", "playing")
         end
 
-        -- มือถือต้องซ่อนเมนูเสมอระหว่างเล่น เพื่อไม่ให้ GUI บังอินพุตเกม
-        if (State.menuVisible and Cap.mobile)
-            or (State.menuVisible and Settings.autoHide and not options.fromAuto) then
+        -- ต้องซ่อนเมนูระหว่างเล่นเสมอ: เมนูหลักกว้าง 840x600 บังจุดคลิกเกือบทั้งจอ
+        -- (เดิมพึ่ง autoHide ทำให้เมื่อผู้ใช้ปิด autoHide Macro จะวิ่งแต่คลิกถูกข้าม)
+        if State.menuVisible then
             setMenuVisible(false)
             State.autoHidden = true
+            Log.add("info", "ซ่อนเมนูระหว่างเล่นเพื่อไม่ให้บังจุดคลิก")
         end
 
         local ok, err = pcall(runPlayback, token, events, loops, loopsDisplay, speed)
@@ -11265,6 +11360,11 @@ RuntimeHandle.getInput = function()
         ready = Input.ready,
         virtual = Input.isVirtual(),
         afk = Cap.afk == true,
+        virtualInputReady = Cap.virtualInputReady == true,
+        virtualInputError = Cap.virtualInputError,
+        vimReady = Cap.vimReady == true,
+        realReady = Cap.realReady == true,
+        realMissing = Cap.realMissing,
     }
 end
 RuntimeHandle.installGameAdapter = function(adapter)
