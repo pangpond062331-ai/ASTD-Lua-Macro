@@ -2804,31 +2804,46 @@ end
 
 function Input.scroll(amount)
     amount = numberOr(amount, 0)
-    if type(mousescroll) == "function" then
-        local ok, err = pcall(mousescroll, amount)
-        if not ok then
-            Input.lastError = tostring(err)
-            return false, tostring(err)
+    local point = Input.point or getMousePosition() or Vector2.new(0, 0)
+
+    -- ต้องเลื่อนที่ตำแหน่งเป้าหมายของ Macro ไม่ใช่ตำแหน่งเมาส์จริง
+    -- (mousescroll ของ executor ใช้ตำแหน่งเคอร์เซอร์จริง ซึ่งอาจทำให้กล้องเกมขยับ)
+    if Input.backend == "virtualinput" then
+        local object = Input.virtualInput
+        if object then
+            local ok, err = pcall(function()
+                object:SendPointerAction(point, { Wheel = amount })
+            end)
+            if ok then
+                return true
+            end
+            if not demoteToVim(err) then
+                Input.lastError = tostring(err)
+                return false, tostring(err)
+            end
+        elseif not demoteToVim("VirtualInput หายไป") then
+            return false, "VirtualInput ไม่พร้อมใช้งาน"
         end
-        return true
-    elseif Input.backend == "virtualinput" and Input.virtualInput then
-        local ok, err = pcall(function()
-            Input.virtualInput:SendPointerAction(Input.point, { Wheel = amount })
-        end)
-        if not ok then
-            Input.lastError = tostring(err)
-            return false, tostring(err)
-        end
-        return true
-    elseif Input.backend == "vim" then
+    end
+
+    if Input.backend == "vim" then
         local ok, err = pcall(function()
             Input.vim:SendMouseWheelEvent(
-                math.floor(Input.point.X),
-                math.floor(Input.point.Y),
+                math.floor(point.X),
+                math.floor(point.Y),
                 amount >= 0,
                 inputLayerCollector()
             )
         end)
+        if not ok then
+            Input.lastError = tostring(err)
+            return false, tostring(err)
+        end
+        return true
+    end
+
+    if type(mousescroll) == "function" then
+        local ok, err = pcall(mousescroll, amount)
         if not ok then
             Input.lastError = tostring(err)
             return false, tostring(err)
@@ -9410,6 +9425,10 @@ local function applyEvent(event)
     end
     if hideDock then
         UI.dock.Visible = false
+        if not State.dockHiddenWarned then
+            State.dockHiddenWarned = true
+            Log.add("info", "dock ทับจุดคลิก — ซ่อน dock ชั่วคราวระหว่างส่งคลิก")
+        end
     end
 
     local ok, err = pcall(function()
@@ -9902,6 +9921,7 @@ function App.startPlayback(options)
     State.guiFallbackWarned = false
     State.screenClickWarned = false
     State.strictGuiWarned = false
+    State.dockHiddenWarned = false
     State.selectionLimitWarned = false
     State.upgradeReselectLogged = false
     State.heldMousePoints = {}
