@@ -11253,6 +11253,15 @@ end
 RuntimeHandle.getCapabilities = function()
     return Cap
 end
+RuntimeHandle.getInput = function()
+    return {
+        backend = Input.backend,
+        describe = Input.describe(),
+        ready = Input.ready,
+        virtual = Input.isVirtual(),
+        afk = Cap.afk == true,
+    }
+end
 RuntimeHandle.installGameAdapter = function(adapter)
     return App.installGameAdapter(adapter)
 end
