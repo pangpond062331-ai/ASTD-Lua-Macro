@@ -478,9 +478,15 @@ local Cap = {
     inputLabel = "ไม่พร้อม",
     inputDetail = "ไม่พบ API อินพุตที่ใช้ได้",
     realMissing = {},
+    realReady = false,
     virtualUser = nil,
     virtualReady = false,
     virtualMissing = {},
+    virtualInput = nil,
+    virtualInputReady = false,
+    virtualInputError = nil,
+    vim = nil,
+    vimReady = false,
     files = false,
     clipboard = false,
     gui = "none",
@@ -549,6 +555,41 @@ local function detectCapabilities()
             table.insert(Cap.realMissing, item.name)
         end
     end
+    Cap.realReady = #Cap.realMissing == 0
+
+    -- อินพุตเสมือนของ Roblox: ส่งเมาส์/คีย์เข้าเกมโดยไม่ย้ายเมาส์จริงของ OS
+    -- VirtualInput เป็น API สาธารณะ (UserInputService:CreateVirtualInput)
+    Cap.virtualInput = nil
+    Cap.virtualInputReady = false
+    Cap.virtualInputError = nil
+    local createOk, created = pcall(function()
+        return UserInputService:CreateVirtualInput()
+    end)
+    if createOk
+        and created
+        and instanceMethodExists(created, "SendMousePosition")
+        and instanceMethodExists(created, "SendMouseButton")
+    then
+        Cap.virtualInput = created
+        Cap.virtualInputReady = true
+    else
+        Cap.virtualInputError = createOk and "CreateVirtualInput ไม่คืน VirtualInput" or tostring(created)
+    end
+
+    -- VirtualInputManager (internal service ที่ executor เปิดให้)
+    -- ใช้เป็นทางสำรองเมื่อ VirtualInput ถูกจำกัดสิทธิ์/คลิกใกล้ topbar ไม่ได้
+    Cap.vim = nil
+    Cap.vimReady = false
+    local vimOk, vim = pcall(function()
+        return game:GetService("VirtualInputManager")
+    end)
+    if vimOk and vim
+        and instanceMethodExists(vim, "SendMouseMoveEvent")
+        and instanceMethodExists(vim, "SendMouseButtonEvent")
+    then
+        Cap.vim = vim
+        Cap.vimReady = true
+    end
 
     Cap.virtualUser = nil
     Cap.virtualReady = false
@@ -568,10 +609,18 @@ local function detectCapabilities()
         Cap.virtualMissing = { "VirtualUser service" }
     end
 
-    if #Cap.realMissing == 0 then
+    if Cap.virtualInputReady then
+        Cap.input = "virtualinput"
+        Cap.inputLabel = "VirtualInput (เมาส์จริงไม่ขยับ)"
+        Cap.inputDetail = "คลิก/วางผ่าน VirtualInput ของ Roblox — เมาส์จริงไม่ถูกย้าย"
+    elseif Cap.vimReady then
+        Cap.input = "vim"
+        Cap.inputLabel = "VirtualInputManager (เมาส์จริงไม่ขยับ)"
+        Cap.inputDetail = "คลิก/วางผ่าน VirtualInputManager — เมาส์จริงไม่ถูกย้าย"
+    elseif Cap.realReady then
         Cap.input = "real"
         Cap.inputLabel = "Executor API (Real)"
-        Cap.inputDetail = "ใช้อินพุตของ executor โดยตรง"
+        Cap.inputDetail = "fallback: mousemoveabs จะขยับเมาส์จริง"
     elseif Cap.virtualReady then
         Cap.input = "virtual"
         Cap.inputLabel = "Roblox VirtualUser (ทดลอง)"
@@ -596,7 +645,8 @@ local function detectCapabilities()
         and type(makefolder) == "function"
         and type(delfile) == "function"
     Cap.clipboard = type(setclipboard) == "function"
-    Cap.afk = Cap.input == "real" and type(mousemoverel) == "function"
+    Cap.afk = Cap.virtualInputReady or Cap.vimReady
+        or (Cap.realReady and type(mousemoverel) == "function")
 
     if type(identifyexecutor) == "function" then
         local ok, name, version = pcall(identifyexecutor)
@@ -1128,6 +1178,7 @@ local State: any = {
     playbackFailures = 0,
     playbackEvents = nil,
     worldFallbackWarned = false,
+    worldProjectionFallbackWarned = false,
     guiFallbackWarned = false,
     screenClickWarned = false,
     strictGuiWarned = false,
@@ -1380,6 +1431,8 @@ local DEFAULT_SETTINGS = {
     recordMotion = false,
     recordMovementKeys = false,
     worldAnchor = true,
+    worldFallback = false,
+    noMouseMove = true,
     scaleCoords = false,
     offsetX = 0,
     offsetY = 0,
@@ -1420,6 +1473,8 @@ local function loadSettings()
     Settings.recordMotion = boolOr(data.recordMotion, false)
     Settings.recordMovementKeys = boolOr(data.recordMovementKeys, false)
     Settings.worldAnchor = boolOr(data.worldAnchor, true)
+    Settings.worldFallback = boolOr(data.worldFallback, false)
+    Settings.noMouseMove = boolOr(data.noMouseMove, true)
     Settings.scaleCoords = boolOr(data.scaleCoords, Settings.scaleCoords)
     Settings.offsetX = math.floor(math.clamp(numberOr(data.offsetX, Settings.offsetX), -1000, 1000))
     Settings.offsetY = math.floor(math.clamp(numberOr(data.offsetY, Settings.offsetY), -1000, 1000))
@@ -1456,6 +1511,8 @@ local function saveSettings()
         recordMotion = Settings.recordMotion == true,
         recordMovementKeys = Settings.recordMovementKeys == true,
         worldAnchor = Settings.worldAnchor ~= false,
+        worldFallback = Settings.worldFallback == true,
+        noMouseMove = Settings.noMouseMove ~= false,
         scaleCoords = Settings.scaleCoords,
         offsetX = Settings.offsetX,
         offsetY = Settings.offsetY,
@@ -2289,6 +2346,9 @@ local Input = {
     backend = "none",
     ready = false,
     virtualUser = nil,
+    virtualInput = nil,
+    vim = nil,
+    switchWarned = false,
     captured = false,
     captureWarned = false,
     point = Vector2.new(0, 0),
@@ -2329,11 +2389,109 @@ local function virtualCall(methodName, ...)
     return true, result
 end
 
+local function inputLayerCollector()
+    local player = Players.LocalPlayer
+    if player then
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        if playerGui then
+            return playerGui
+        end
+    end
+    return game
+end
+
+local function createVirtualInputObject()
+    local ok, object = pcall(function()
+        return UserInputService:CreateVirtualInput()
+    end)
+    if ok and object
+        and instanceMethodExists(object, "SendMousePosition")
+        and instanceMethodExists(object, "SendMouseButton")
+    then
+        return object
+    end
+    return nil, ok and "CreateVirtualInput ไม่คืน VirtualInput" or tostring(object)
+end
+
+local function applyInputLabels()
+    if Input.backend == "virtualinput" then
+        Cap.inputLabel = "VirtualInput (เมาส์จริงไม่ขยับ)"
+        Cap.inputDetail = "คลิก/วางผ่าน VirtualInput ของ Roblox — เมาส์จริงไม่ถูกย้าย"
+    elseif Input.backend == "vim" then
+        Cap.inputLabel = "VirtualInputManager (เมาส์จริงไม่ขยับ)"
+        Cap.inputDetail = "คลิก/วางผ่าน VirtualInputManager — เมาส์จริงไม่ถูกย้าย"
+    elseif Input.backend == "real" then
+        Cap.inputLabel = "Executor API (Real)"
+        Cap.inputDetail = "fallback: mousemoveabs จะขยับเมาส์จริง"
+    elseif Input.backend == "virtual" then
+        Cap.inputLabel = "Roblox VirtualUser (ทดลอง)"
+        Cap.inputDetail = "VirtualUser อาจขยับเมาส์จริง"
+    else
+        Cap.inputLabel = "ไม่พร้อม"
+        Cap.inputDetail = "ไม่พบ API อินพุตที่ใช้ได้"
+    end
+    Cap.input = Input.backend
+end
+
+local function demoteToVim(reason)
+    if not Cap.vim then
+        return false
+    end
+    Input.virtualInput = nil
+    Input.vim = Cap.vim
+    Input.backend = "vim"
+    applyInputLabels()
+    Cap.afk = true
+    if not Input.switchWarned then
+        Input.switchWarned = true
+        Log.add("warn", "VirtualInput ใช้กับตำแหน่งนี้ไม่ได้ (" .. tostring(reason) .. ") — เปลี่ยนไปใช้ VirtualInputManager")
+    end
+    return true
+end
+
 function Input.init()
-    Input.backend = Cap.input
-    Input.ready = Cap.input ~= "none"
+    Input.virtualInput = nil
+    Input.vim = nil
     Input.virtualUser = Cap.virtualUser
     Input.lastError = nil
+    Input.switchWarned = false
+    Input.captured = false
+
+    -- ค่าเริ่มต้น: ใช้อินพุตเสมือนเพื่อไม่ให้เมาส์จริงขยับ
+    local preferVirtual = Settings.noMouseMove ~= false
+    if preferVirtual then
+        local object = Cap.virtualInput
+        if not object then
+            local created, createError = createVirtualInputObject()
+            if created then
+                object = created
+                Cap.virtualInput = created
+                Cap.virtualInputReady = true
+            else
+                Cap.virtualInputError = createError
+            end
+        end
+        if object then
+            Input.virtualInput = object
+            Input.backend = "virtualinput"
+        elseif Cap.vim then
+            Input.vim = Cap.vim
+            Input.backend = "vim"
+        end
+    end
+    if Input.backend == "none" then
+        if Cap.realReady then
+            Input.backend = "real"
+        elseif Cap.virtualReady then
+            Input.backend = "virtual"
+        end
+    end
+
+    Input.ready = Input.backend ~= "none"
+    applyInputLabels()
+    Cap.afk = Input.backend == "virtualinput"
+        or Input.backend == "vim"
+        or (Input.backend == "real" and type(mousemoverel) == "function")
     return Input.ready
 end
 
@@ -2341,8 +2499,16 @@ function Input.available()
     return Input.ready and Input.backend ~= "none"
 end
 
+function Input.isVirtual()
+    return Input.backend == "virtualinput" or Input.backend == "vim"
+end
+
 function Input.describe()
-    if Input.backend == "real" then
+    if Input.backend == "virtualinput" then
+        return "VirtualInput (เมาส์จริงไม่ขยับ)"
+    elseif Input.backend == "vim" then
+        return "VirtualInputManager (เมาส์จริงไม่ขยับ)"
+    elseif Input.backend == "real" then
         return "Executor API (Real)"
     elseif Input.backend == "virtual" then
         return "VirtualUser (ทดลอง)"
@@ -2354,7 +2520,37 @@ function Input.move(x, y)
     x = math.max(0, math.floor(numberOr(x, 0) + 0.5))
     y = math.max(0, math.floor(numberOr(y, 0) + 0.5))
     Input.point = Vector2.new(x, y)
-    if Input.backend == "real" then
+
+    if Input.backend == "virtualinput" then
+        local object = Input.virtualInput
+        if not object then
+            if not demoteToVim("VirtualInput หายไป") then
+                return false, "VirtualInput ไม่พร้อมใช้งาน"
+            end
+        else
+            local ok, err = pcall(function()
+                object:SendMousePosition(Input.point)
+            end)
+            if ok then
+                return true
+            end
+            if not demoteToVim(err) then
+                Input.lastError = tostring(err)
+                return false, tostring(err)
+            end
+        end
+    end
+
+    if Input.backend == "vim" then
+        local ok, err = pcall(function()
+            Input.vim:SendMouseMoveEvent(x, y, inputLayerCollector())
+        end)
+        if not ok then
+            Input.lastError = tostring(err)
+            return false, tostring(err)
+        end
+        return true
+    elseif Input.backend == "real" then
         local ok, err = pcall(mousemoveabs, x, y)
         if not ok then
             Input.lastError = tostring(err)
@@ -2368,7 +2564,45 @@ function Input.move(x, y)
 end
 
 function Input.press(button)
-    if Input.backend == "real" then
+    if Input.backend == "virtualinput" then
+        local object = Input.virtualInput
+        local inputType = button == "Right"
+            and Enum.UserInputType.MouseButton2
+            or Enum.UserInputType.MouseButton1
+        if object then
+            local ok, err = pcall(function()
+                object:SendMouseButton(Input.point, inputType, true, 0)
+            end)
+            if ok then
+                return true
+            end
+            if not demoteToVim(err) then
+                Input.lastError = tostring(err)
+                return false, tostring(err)
+            end
+        elseif not demoteToVim("VirtualInput หายไป") then
+            return false, "VirtualInput ไม่พร้อมใช้งาน"
+        end
+    end
+
+    if Input.backend == "vim" then
+        local mouseButton = button == "Right" and 1 or 0
+        local ok, err = pcall(function()
+            Input.vim:SendMouseButtonEvent(
+                math.floor(Input.point.X),
+                math.floor(Input.point.Y),
+                mouseButton,
+                true,
+                inputLayerCollector(),
+                0
+            )
+        end)
+        if not ok then
+            Input.lastError = tostring(err)
+            return false, tostring(err)
+        end
+        return true
+    elseif Input.backend == "real" then
         local ok, err
         if button == "Right" then
             ok, err = pcall(mouse2press)
@@ -2391,7 +2625,45 @@ function Input.press(button)
 end
 
 function Input.release(button)
-    if Input.backend == "real" then
+    if Input.backend == "virtualinput" then
+        local object = Input.virtualInput
+        local inputType = button == "Right"
+            and Enum.UserInputType.MouseButton2
+            or Enum.UserInputType.MouseButton1
+        if object then
+            local ok, err = pcall(function()
+                object:SendMouseButton(Input.point, inputType, false, 0)
+            end)
+            if ok then
+                return true
+            end
+            if not demoteToVim(err) then
+                Input.lastError = tostring(err)
+                return false, tostring(err)
+            end
+        elseif not demoteToVim("VirtualInput หายไป") then
+            return false, "VirtualInput ไม่พร้อมใช้งาน"
+        end
+    end
+
+    if Input.backend == "vim" then
+        local mouseButton = button == "Right" and 1 or 0
+        local ok, err = pcall(function()
+            Input.vim:SendMouseButtonEvent(
+                math.floor(Input.point.X),
+                math.floor(Input.point.Y),
+                mouseButton,
+                false,
+                inputLayerCollector(),
+                0
+            )
+        end)
+        if not ok then
+            Input.lastError = tostring(err)
+            return false, tostring(err)
+        end
+        return true
+    elseif Input.backend == "real" then
         local ok, err
         if button == "Right" then
             ok, err = pcall(mouse2release)
@@ -2413,13 +2685,60 @@ function Input.release(button)
     return false, "ไม่มี API อินพุต"
 end
 
+local function keyCodeFrom(vk, keyName)
+    if type(keyName) == "string" and keyName ~= "" then
+        local ok, code = pcall(function()
+            return Enum.KeyCode[keyName]
+        end)
+        if ok and code then
+            return code
+        end
+    end
+    vk = numberOr(vk, nil)
+    if vk then
+        local ok, code = pcall(function()
+            return Enum.KeyCode:FromValue(vk)
+        end)
+        if ok and code then
+            return code
+        end
+    end
+    return nil
+end
+
 function Input.keyDown(vk, keyName)
-    if Input.backend == "real" then
+    -- keypress/keyrelease ของ executor ไม่ย้ายเมาส์ จึงใช้ก่อนเสมอเมื่อมี
+    if type(keypress) == "function" then
         vk = numberOr(vk, keyName and VK_BY_NAME[keyName])
         if not vk then
             return false, "ไม่พบรหัสปุ่ม " .. tostring(keyName)
         end
         local ok, err = pcall(keypress, vk)
+        if not ok then
+            Input.lastError = tostring(err)
+            return false, tostring(err)
+        end
+        return true
+    end
+
+    local keyCode = keyCodeFrom(vk, keyName)
+    if Input.backend == "virtualinput" and keyCode then
+        local ok, err = pcall(function()
+            Input.virtualInput:SendKey(true, keyCode, false)
+        end)
+        if not ok then
+            if not demoteToVim(err) then
+                Input.lastError = tostring(err)
+                return false, tostring(err)
+            end
+        else
+            return true
+        end
+    end
+    if Input.backend == "vim" and keyCode then
+        local ok, err = pcall(function()
+            Input.vim:SendKeyEvent(true, keyCode, false, inputLayerCollector())
+        end)
         if not ok then
             Input.lastError = tostring(err)
             return false, tostring(err)
@@ -2435,12 +2754,37 @@ function Input.keyDown(vk, keyName)
 end
 
 function Input.keyUp(vk, keyName)
-    if Input.backend == "real" then
+    if type(keyrelease) == "function" then
         vk = numberOr(vk, keyName and VK_BY_NAME[keyName])
         if not vk then
             return false, "ไม่พบรหัสปุ่ม " .. tostring(keyName)
         end
         local ok, err = pcall(keyrelease, vk)
+        if not ok then
+            Input.lastError = tostring(err)
+            return false, tostring(err)
+        end
+        return true
+    end
+
+    local keyCode = keyCodeFrom(vk, keyName)
+    if Input.backend == "virtualinput" and keyCode then
+        local ok, err = pcall(function()
+            Input.virtualInput:SendKey(false, keyCode, false)
+        end)
+        if not ok then
+            if not demoteToVim(err) then
+                Input.lastError = tostring(err)
+                return false, tostring(err)
+            end
+        else
+            return true
+        end
+    end
+    if Input.backend == "vim" and keyCode then
+        local ok, err = pcall(function()
+            Input.vim:SendKeyEvent(false, keyCode, false, inputLayerCollector())
+        end)
         if not ok then
             Input.lastError = tostring(err)
             return false, tostring(err)
@@ -2456,21 +2800,60 @@ function Input.keyUp(vk, keyName)
 end
 
 function Input.scroll(amount)
-    if Input.backend == "real" and type(mousescroll) == "function" then
-        local ok, err = pcall(mousescroll, numberOr(amount, 0))
+    amount = numberOr(amount, 0)
+    if type(mousescroll) == "function" then
+        local ok, err = pcall(mousescroll, amount)
         if not ok then
             Input.lastError = tostring(err)
             return false, tostring(err)
         end
         return true
-    elseif Input.backend == "virtual" then
-        return false, "VirtualUser ไม่รองรับการเลื่อนล้อเมาส์"
+    elseif Input.backend == "vim" then
+        local ok, err = pcall(function()
+            Input.vim:SendMouseWheelEvent(
+                math.floor(Input.point.X),
+                math.floor(Input.point.Y),
+                amount >= 0,
+                inputLayerCollector()
+            )
+        end)
+        if not ok then
+            Input.lastError = tostring(err)
+            return false, tostring(err)
+        end
+        return true
     end
-    return false, "ไม่มี API อินพุต"
+    return false, "backend นี้ไม่รองรับการเลื่อนล้อเมาส์"
 end
 
 function Input.nudge()
-    if Input.backend == "real" and type(mousemoverel) == "function" then
+    -- AFK Guard: ขยับเคอร์เซอร์เสมือนเท่านั้น ไม่แตะเมาส์จริง
+    if Input.backend == "virtualinput" and Input.virtualInput then
+        local base = getMousePosition() or Input.point
+        local ok1 = pcall(function()
+            Input.virtualInput:SendMousePosition(base + Vector2.new(1, 0))
+        end)
+        local ok2 = pcall(function()
+            Input.virtualInput:SendMousePosition(base)
+        end)
+        if ok1 and ok2 then
+            return true
+        end
+        return false, "VirtualInput nudge ไม่สำเร็จ"
+    elseif Input.backend == "vim" and Input.vim then
+        local base = getMousePosition() or Input.point
+        local layer = inputLayerCollector()
+        local ok1 = pcall(function()
+            Input.vim:SendMouseMoveEvent(base.X + 1, base.Y, layer)
+        end)
+        local ok2 = pcall(function()
+            Input.vim:SendMouseMoveEvent(base.X, base.Y, layer)
+        end)
+        if ok1 and ok2 then
+            return true
+        end
+        return false, "VirtualInputManager nudge ไม่สำเร็จ"
+    elseif Input.backend == "real" and type(mousemoverel) == "function" then
         local position = getMousePosition()
         local deltaX = 1
         if position then
@@ -2486,7 +2869,7 @@ function Input.nudge()
         end
         return false, "mousemoverel ใช้งานไม่ได้"
     end
-    return false, "AFK Guard ไม่รองรับบน backend นี้ (ต้องมี mousemoverel)"
+    return false, "AFK Guard ไม่รองรับบน backend นี้"
 end
 
 -- ============================================================================
@@ -5207,6 +5590,30 @@ local function buildUI()
     local settingsPage = makePage("settings", "Settings", "พฤติกรรม Macro, AFK Guard, พิกัด และข้อมูลระบบ")
     do
         local _, body = makeCard(settingsPage, "การทำงาน")
+        UI.refs.noMouseMoveToggle = makeToggleRow(body, "เมาส์จริงอยู่กับที่ (Virtual Input)", Settings.noMouseMove ~= false, "เล่นซ้ำโดยไม่ย้ายเมาส์ OS • ถ้าอินพุตไม่ถึงเกม ให้ปิดเพื่อกลับไปใช้ executor แบบเดิม (เมาส์จะขยับ)", function(value)
+            Settings.noMouseMove = value
+            saveSettings()
+            Input.init()
+            if UI.refs.noMouseMoveToggle then
+                UI.refs.noMouseMoveToggle.set(Settings.noMouseMove ~= false, false)
+            end
+            if UI.refs.infoInput then
+                UI.refs.infoInput.Text = Cap.inputLabel
+                UI.refs.infoInput.TextColor3 = Cap.input == "none" and Theme.danger
+                    or ((Cap.input == "real" or Cap.input == "virtual") and Theme.warning or Theme.success)
+            end
+            if UI.refs.autoInputStatus then
+                UI.refs.autoInputStatus.Text = "Input: " .. Cap.inputLabel
+                UI.refs.autoInputStatus.TextColor3 = Cap.input == "none" and Theme.danger
+                    or ((Cap.input == "real" or Cap.input == "virtual") and Theme.warning or Theme.success)
+            end
+            if UI.refs.recordCapability then
+                UI.refs.recordCapability.Text = "Input: " .. Cap.inputLabel .. " • " .. Cap.inputDetail
+                UI.refs.recordCapability.TextColor3 = Theme.muted
+            end
+            Log.add("info", "อินพุตที่ใช้: " .. Input.describe() .. (Input.isVirtual() and " (ไม่ย้ายเมาส์จริง)" or ""))
+        end)
+
         UI.refs.guardFocusToggle = makeToggleRow(body, "พักเมื่อเกมไม่ active", Settings.guardFocus, "ถ้าปิด การเล่นจะดำเนินต่อ แต่ executor อาจไม่ส่งอินพุต", function(value)
             Settings.guardFocus = value
             saveSettings()
@@ -5234,6 +5641,11 @@ local function buildUI()
 
         UI.refs.worldAnchorToggle = makeToggleRow(body, "ยึดคลิกบนแผนที่กับจุดในโลก (ทดลอง)", Settings.worldAnchor, "เฉพาะคลิกในโลกเกมที่ไม่ใช่ UI • ถ้ายืนยันตำแหน่ง/เป้าหมายไม่ได้จะหยุดพร้อมแจ้งเตือน • ยังต้องทดสอบในเกมจริง", function(value)
             Settings.worldAnchor = value
+            saveSettings()
+        end)
+
+        UI.refs.worldFallbackToggle = makeToggleRow(body, "ใช้พิกัดหน้าจอเดิมเมื่อจุดโลกอยู่นอกจอ", Settings.worldFallback, "ทางเลือกสำรองเมื่อกล้องตอนเล่นไม่ตรงกับตอนบันทึก • อาจคลิกผิดตำแหน่ง • ค่าเริ่มต้นปิด", function(value)
+            Settings.worldFallback = value
             saveSettings()
         end)
 
@@ -5671,8 +6083,10 @@ function App.refreshAutoUI()
         end
     end
     if UI.refs.autoInputStatus then
-        UI.refs.autoInputStatus.Text = "Input: " .. Cap.inputLabel .. (Cap.input == "virtual" and " • ยังไม่ยืนยันบน Delta" or "")
-        UI.refs.autoInputStatus.TextColor3 = Cap.input == "none" and Theme.danger or (Cap.input == "virtual" and Theme.warning or Theme.success)
+        UI.refs.autoInputStatus.Text = "Input: " .. Cap.inputLabel
+            .. (Cap.input == "real" and " • เมาส์จริงจะขยับ" or (Cap.input == "virtual" and " • ยังไม่ยืนยันบน Delta" or ""))
+        UI.refs.autoInputStatus.TextColor3 = Cap.input == "none" and Theme.danger
+            or ((Cap.input == "real" or Cap.input == "virtual") and Theme.warning or Theme.success)
     end
 
     local support = {}
@@ -6221,6 +6635,9 @@ function App.refreshSettingsUI()
     if UI.refs.guardFocusToggle then
         UI.refs.guardFocusToggle.set(Settings.guardFocus, false)
     end
+    if UI.refs.noMouseMoveToggle then
+        UI.refs.noMouseMoveToggle.set(Settings.noMouseMove ~= false, false)
+    end
     if UI.refs.autosaveToggle then
         UI.refs.autosaveToggle.set(Settings.autosave, false)
     end
@@ -6235,6 +6652,9 @@ function App.refreshSettingsUI()
     end
     if UI.refs.worldAnchorToggle then
         UI.refs.worldAnchorToggle.set(Settings.worldAnchor ~= false, false)
+    end
+    if UI.refs.worldFallbackToggle then
+        UI.refs.worldFallbackToggle.set(Settings.worldFallback == true, false)
     end
     if UI.refs.scaleCoordsToggle then
         UI.refs.scaleCoordsToggle.set(Settings.scaleCoords, false)
@@ -6252,7 +6672,8 @@ function App.refreshSettingsUI()
     end
     if UI.refs.infoInput then
         UI.refs.infoInput.Text = Cap.inputLabel
-        UI.refs.infoInput.TextColor3 = Cap.input == "none" and Theme.danger or (Cap.input == "virtual" and Theme.warning or Theme.success)
+        UI.refs.infoInput.TextColor3 = Cap.input == "none" and Theme.danger
+            or ((Cap.input == "real" or Cap.input == "virtual") and Theme.warning or Theme.success)
     end
     if UI.refs.infoFiles then
         UI.refs.infoFiles.Text = App.apiStatus.files and "พร้อม" or "จำกัด"
@@ -8711,7 +9132,31 @@ end
 local function resolveWorldEventPoint(event)
     local x, y, projectError = projectWorldPoint(event.world)
     if not x then
-        return nil, nil, projectError
+        if Settings.worldFallback ~= true then
+            return nil, nil, tostring(projectError)
+                .. " — หมุนกล้องให้ตรงกับตอนบันทึก หรือเปิดตั้งค่า \"ใช้พิกัดหน้าจอเดิมเมื่อจุดโลกอยู่นอกจอ\""
+        end
+        -- worldFallback: ใช้พิกัดหน้าจอที่บันทึกไว้ แต่ยังต้องตรวจว่าไม่มี GUI บัง
+        local sx, sy = scaledPoint(event)
+        if pointInGui(Vector2.new(sx, sy)) then
+            return nil, nil, nil, "own"
+        end
+        local target, _, checked, ownBlocked = GuiTargeting.guiTargetAt(sx, sy)
+        if ownBlocked then
+            return nil, nil, nil, "own"
+        end
+        if target then
+            return nil, nil, "พิกัดหน้าจอสำรองถูก GUI เกมบัง ("
+                .. tostring(target.fullName or target.className or "GUI") .. ")"
+        end
+        if not checked then
+            return nil, nil, "ตรวจสอบ GUI ไม่ได้ จึงยืนยันไม่ได้ว่าพิกัดหน้าจอสำรองไม่ถูก UI บัง"
+        end
+        if not State.worldProjectionFallbackWarned then
+            State.worldProjectionFallbackWarned = true
+            Log.add("warn", "worldFallback ทำงาน: จุดโลกอยู่นอกจอ/หลังกล้อง — ใช้พิกัดหน้าจอเดิมโดยไม่ได้ยืนยันตำแหน่งโลก")
+        end
+        return sx, sy, nil, nil, "screen"
     end
     if pointInGui(Vector2.new(x, y)) then
         return nil, nil, nil, "own"
@@ -8730,7 +9175,7 @@ local function resolveWorldEventPoint(event)
     if not verified then
         return nil, nil, verifyError
     end
-    return x, y
+    return x, y, nil, nil, "world"
 end
 
 local function resolveGuiEventPoint(event)
@@ -8756,9 +9201,9 @@ local function resolveEventPoint(event)
         return nil, nil, nil, nil, resolveError
     end
     if event.world and Settings.worldAnchor == true then
-        local x, y, resolveError, skip = resolveWorldEventPoint(event)
+        local x, y, resolveError, skip, mode = resolveWorldEventPoint(event)
         if x then
-            return x, y, "world"
+            return x, y, mode or "world"
         end
         if skip then
             return nil, nil, nil, "skip"
@@ -9354,6 +9799,7 @@ function App.startPlayback(options)
     State.playbackFailures = 0
     State.playbackEvents = events
     State.worldFallbackWarned = false
+    State.worldProjectionFallbackWarned = false
     State.guiFallbackWarned = false
     State.screenClickWarned = false
     State.strictGuiWarned = false
@@ -10863,6 +11309,14 @@ else
 end
 
 loadSettings()
+-- ใช้ค่าตั้งค่าที่เพิ่งโหลด (noMouseMove) กำหนด backend จริงอีกครั้ง
+Input.init()
+App.apiStatus.input = Cap.input ~= "none"
+Log.add("info", "อินพุตที่ใช้: " .. Input.describe()
+    .. (Input.isVirtual() and " (เมาส์จริงไม่ถูกย้าย)" or (Cap.input == "real" and " (เมาส์จริงจะขยับ)" or "")))
+if Cap.virtualInputError and not Cap.vimReady then
+    Log.add("warn", "VirtualInput ไม่พร้อม: " .. tostring(Cap.virtualInputError))
+end
 loadProfiles()
 Log.add("info", string.format(
     "Bootstrap 3/5: โหลดตั้งค่า/โปรไฟล์แล้ว (%d โปรไฟล์) • files %s",
@@ -10970,6 +11424,10 @@ if Cap.input == "none" then
     setStatus("ไม่พบ API อินพุต", "error")
 elseif Cap.input == "virtual" then
     setStatus("พร้อม (VirtualUser ทดลอง)", "warn")
+elseif Input.isVirtual() then
+    setStatus("พร้อม (เมาส์จริงอยู่กับที่)", "ready")
+elseif Cap.input == "real" and Settings.noMouseMove ~= false then
+    setStatus("พร้อม (fallback: เมาส์จริงขยับ)", "warn")
 else
     setStatus("พร้อมใช้งาน", "ready")
 end
