@@ -5591,6 +5591,16 @@ local function buildUI()
     do
         local _, body = makeCard(settingsPage, "การทำงาน")
         UI.refs.noMouseMoveToggle = makeToggleRow(body, "เมาส์จริงอยู่กับที่ (Virtual Input)", Settings.noMouseMove ~= false, "เล่นซ้ำโดยไม่ย้ายเมาส์ OS • ถ้าอินพุตไม่ถึงเกม ให้ปิดเพื่อกลับไปใช้ executor แบบเดิม (เมาส์จะขยับ)", function(value)
+            if State.mode == "playing" or State.mode == "paused" then
+                showNotice(
+                    "สลับอินพุตระหว่างเล่นไม่ได้",
+                    "หยุด Macro ก่อนเปลี่ยน backend อินพุต\nเพื่อไม่ให้เมาส์ค้างหรือคลิกผิดตำแหน่ง"
+                )
+                if UI.refs.noMouseMoveToggle then
+                    UI.refs.noMouseMoveToggle.set(Settings.noMouseMove ~= false, false)
+                end
+                return
+            end
             Settings.noMouseMove = value
             saveSettings()
             Input.init()
