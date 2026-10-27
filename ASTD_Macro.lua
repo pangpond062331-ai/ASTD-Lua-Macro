@@ -1112,6 +1112,7 @@ local State: any = {
     dragTouchId = nil,
     selectedSteps = {},
     pendingRecording = nil,
+    recordingContext = nil,
     playbackScale = { x = 1, y = 1 },
     lastSavedAt = 0,
     recoveryWarned = false,
@@ -1756,6 +1757,64 @@ local function sanitizeScreen(raw)
     }
 end
 
+local GAME_CONTEXT_TEXT_LIMIT = 96
+
+local function sanitizeGameContext(raw)
+    if type(raw) ~= "table" then
+        return nil
+    end
+
+    local function text(value, limit)
+        if type(value) ~= "string" then
+            return nil
+        end
+        local out = value:gsub("%c", " ")
+        out = out:gsub("%s+", " ")
+        out = trimText(out)
+        if out == "" then
+            return nil
+        end
+        return out:sub(1, limit or GAME_CONTEXT_TEXT_LIMIT)
+    end
+
+    local context = {
+        capturedAt = math.floor(numberOr(raw.capturedAt, os.time())),
+        verified = raw.verified == true,
+        status = text(raw.status, 24),
+        map = text(raw.map, 96),
+        mode = text(raw.mode, 40),
+        event = text(raw.event, 96),
+        difficulty = text(raw.difficulty, 64),
+        act = text(raw.act, 24),
+        wave = text(raw.wave, 24),
+        sources = {},
+        notes = {},
+    }
+
+    for _, key in ipairs({ "map", "mode", "event", "difficulty", "act", "wave" }) do
+        local source = type(raw.sources) == "table" and text(raw.sources[key], 32) or nil
+        if source then
+            context.sources[key] = source
+        end
+        local note = type(raw.notes) == "table" and text(raw.notes[key], 160) or nil
+        if note then
+            context.notes[key] = note
+        end
+    end
+
+    local hasValue = false
+    for _, key in ipairs({ "map", "mode", "event", "difficulty", "act", "wave" }) do
+        if context[key] then
+            hasValue = true
+            break
+        end
+    end
+    if not hasValue then
+        return nil
+    end
+    return context
+end
+
 local function sanitizeMacro(raw, fallbackName, opts)
     opts = opts or {}
     if type(raw) ~= "table" then
@@ -1793,6 +1852,7 @@ local function sanitizeMacro(raw, fallbackName, opts)
         events = events,
         set = sanitizeSet(raw.set),
         screen = sanitizeScreen(raw.screen),
+        context = sanitizeGameContext(raw.context),
     }
     macro.count = #events
     macro.duration = #events > 0 and events[#events].t or 0
@@ -1986,6 +2046,7 @@ local function profileData(meta, events)
             events = item.events or {},
             set = item.set,
             screen = item.screen,
+            context = item.context,
         })
     end
 
@@ -2589,6 +2650,7 @@ function Recovery.write(pending)
         profileName = pending.profileName,
         screen = pending.screen,
         set = pending.set,
+        context = sanitizeGameContext(pending.context),
         events = pending.events,
     }
     local ok, err = writeJsonFile(RECOVERY_PATH, payload)
@@ -2624,6 +2686,7 @@ function Recovery.read()
         profileId = type(data.profileId) == "string" and data.profileId or nil,
         profileName = type(data.profileName) == "string" and trimText(data.profileName):sub(1, 60) or nil,
         screen = sanitizeScreen(data.screen),
+        context = sanitizeGameContext(data.context),
     }
 end
 
@@ -3291,14 +3354,15 @@ local function showPrompt(title, subtitle, defaultText, confirmText, onConfirm)
     end)
 end
 
-local function showConfirm(title, message, confirmText, onConfirm, isDanger, onCancel)
-    local modal = openModal(title, nil, 460, 210, { dismissable = onCancel == nil })
+local function showConfirm(title, message, confirmText, onConfirm, isDanger, onCancel, messageHeight)
+    local height = math.max(80, math.floor(numberOr(messageHeight, 80)))
+    local modal = openModal(title, nil, 460, height + 130, { dismissable = onCancel == nil })
     if not modal then
         return
     end
 
     local messageLabel = newInstance("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 80),
+        Size = UDim2.new(1, 0, 0, height),
         BackgroundTransparency = 1,
         Font = FONT,
         Text = tostring(message or ""),
@@ -3470,6 +3534,822 @@ local function showImportDialog()
             box:CaptureFocus()
         end)
     end)
+end
+
+-- ============================================================================
+-- 10.1) บริบทเกม — ตรวจจาก GUI/ข้อความที่เกมเปิดเผยเท่านั้น
+-- ============================================================================
+
+local GameContext = {
+    current = nil,
+    lastPollAt = 0,
+    pollInterval = 1,
+    missionIndex = nil,
+    missionIndexSource = nil,
+    warned = {},
+    fields = { "map", "mode", "event", "difficulty", "act", "wave" },
+    labels = {
+        map = "แมพ",
+        mode = "โหมด",
+        event = "Event/Raid",
+        difficulty = "ความยาก",
+        act = "Act/Stage",
+        wave = "Wave",
+    },
+}
+
+function GameContext.text(instance)
+    if not instance or (not instance:IsA("TextLabel") and not instance:IsA("TextButton")) then
+        return nil
+    end
+    local ok, value = pcall(function()
+        return tostring(instance.Text or "")
+    end)
+    if not ok or not value then
+        return nil
+    end
+    value = value:gsub("%s+", " ")
+    value = trimText(value)
+    if value == "" then
+        return nil
+    end
+    return value
+end
+
+function GameContext.playerGui()
+    local player = Players.LocalPlayer
+    if not player then
+        return nil
+    end
+    return player:FindFirstChild("PlayerGui")
+end
+
+function GameContext.hud()
+    local gui = GameContext.playerGui()
+    return gui and gui:FindFirstChild("HUD") or nil
+end
+
+function GameContext.readWave()
+    local hud = GameContext.hud()
+    local label = hud and hud:FindFirstChild("Wave")
+    if not label or not label:IsA("TextLabel") then
+        return nil
+    end
+    local visible = false
+    pcall(function()
+        visible = label.Visible == true
+    end)
+    if not visible then
+        return nil
+    end
+    local text = GameContext.text(label)
+    local current, total = nil, nil
+    if text then
+        current, total = text:match("^Wave%s*(%d+)%s*/%s*(%d+)%s*$")
+    end
+    if not current or not total then
+        return nil
+    end
+    return {
+        values = {
+            wave = tostring(tonumber(current)) .. "/" .. tostring(tonumber(total)),
+        },
+        sources = { wave = "HUD.Wave" },
+        notes = { wave = "จำนวน Wave ที่เกมแสดงระหว่างด่าน" },
+        fresh = true,
+    }
+end
+
+function GameContext.modeForCategory(category)
+    if category == "World1" or category == "World2" then
+        return "Story"
+    elseif category == "Challenges" then
+        return "Challenge"
+    elseif category == "Infinite" then
+        return "Infinite"
+    elseif category == "Trials" then
+        return "Trial"
+    elseif category == "Adventures" then
+        return "Adventure"
+    elseif category == "Misc" then
+        return "Misc"
+    end
+    return nil
+end
+
+function GameContext.buildMissionIndex(chooser)
+    local main = chooser and chooser:FindFirstChild("Main")
+    if not main then
+        return nil
+    end
+    local index = {}
+    local count = 0
+    for _, category in ipairs(main:GetChildren()) do
+        if category:IsA("ScrollingFrame") then
+            local mode = GameContext.modeForCategory(category.Name)
+            for _, entry in ipairs(category:GetChildren()) do
+                if entry:IsA("GuiObject") then
+                    local titleLabel = entry:FindFirstChild("MissionTitle", true)
+                    local title = GameContext.text(titleLabel)
+                    if title then
+                        local clean = trimText((title:gsub("^%s*%d+%.%s*", "")))
+                        local key = string.lower(clean)
+                        if clean ~= "" then
+                            local existing = index[key]
+                            if existing == nil then
+                                index[key] = {
+                                    title = clean,
+                                    category = category.Name,
+                                    mode = mode,
+                                }
+                                count += 1
+                            elseif existing.category ~= category.Name then
+                                -- ชื่อซ้ำหลายหมวด: ไม่เดาโหมด ให้แสดง Unknown
+                                existing.ambiguous = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if count == 0 then
+        return nil
+    end
+    GameContext.missionIndex = index
+    GameContext.missionIndexSource = chooser
+    return index
+end
+
+function GameContext.readMenu()
+    local hud = GameContext.hud()
+    local missions = hud and hud:FindFirstChild("MissionsV2")
+    if not missions then
+        return nil
+    end
+    local chooser = missions:FindFirstChild("MissionChooser")
+    local frame = missions:FindFirstChild("MissionFrame")
+    local frameOpen = frame and frame:IsA("GuiObject") and frame.Visible == true
+    if not frameOpen then
+        return nil
+    end
+
+    local textLabel = frame and frame:FindFirstChild("MissionText", true)
+    local missionText = GameContext.text(textLabel)
+    if not missionText then
+        return nil
+    end
+
+    local index = GameContext.missionIndex
+    if not index or GameContext.missionIndexSource ~= chooser then
+        index = GameContext.buildMissionIndex(chooser)
+    end
+    local clean = trimText((missionText:gsub("^%s*%d+%.%s*", "")))
+    local key = string.lower(clean)
+    local info = index and index[key] or nil
+    if not info then
+        -- บางหน้าจอต่อท้ายด้วยลำดับ เช่น "ชื่อด่าน (1)" — ใช้ได้เฉพาะเมื่อพบชื่อตรงในดัชนี
+        local base = trimText((clean:gsub("%s*%(%d+%)%s*$", "")))
+        if base ~= "" then
+            info = index and index[string.lower(base)] or nil
+        end
+    end
+    local map = info and info.title or clean
+    if not map or map == "" then
+        return nil
+    end
+
+    local values = { map = map }
+    local sources = { map = "เมนู MissionsV2" }
+    local notes = { map = "ชื่อด่านที่เมนูเกมแสดงอยู่ (ไม่ใช่ชื่อแมพระหว่างเล่น)" }
+    if info and info.mode and not info.ambiguous then
+        values.mode = info.mode
+        sources.mode = "หมวดในเมนู MissionsV2"
+        notes.mode = "จับคู่ชื่อด่านกับหมวด " .. tostring(info.category)
+    end
+    return {
+        values = values,
+        sources = sources,
+        notes = notes,
+        fresh = true,
+    }
+end
+
+function GameContext.readResult()
+    local hud = GameContext.hud()
+    local missionEnd = hud and hud:FindFirstChild("MissionEnd")
+    local endedNow = missionEnd and missionEnd:IsA("GuiObject") and missionEnd.Visible == true
+    local gui = GameContext.playerGui()
+    local rewards = gui and gui:FindFirstChild("StageRewards")
+    if not rewards then
+        return nil
+    end
+    if not endedNow then
+        local enabled = false
+        pcall(function()
+            enabled = rewards.Enabled == true
+        end)
+        if not enabled then
+            return nil
+        end
+    end
+
+    local stats = rewards:FindFirstChild("2LevelStats", true)
+    if not stats then
+        return nil
+    end
+    local title = GameContext.text(stats:FindFirstChild("1Title", true))
+    local difficulty = GameContext.text(stats:FindFirstChild("3Difficulty", true))
+    local values = {}
+    local sources = {}
+    local notes = {}
+    if title then
+        values.event = title
+        sources.event = "StageRewards"
+        notes.event = "ชื่อ Event ที่สรุปผลด่านแสดง"
+    end
+    if difficulty then
+        values.difficulty = difficulty
+        sources.difficulty = "StageRewards"
+        notes.difficulty = "ระดับความยากที่สรุปผลด่านแสดง"
+    end
+    if next(values) == nil then
+        return nil
+    end
+    return {
+        values = values,
+        sources = sources,
+        notes = notes,
+        fresh = true,
+    }
+end
+
+function GameContext.readEventPanel()
+    local gui = GameContext.playerGui()
+    if not gui then
+        return nil
+    end
+    -- อ่านเฉพาะสำเนาที่เกมสร้างใน PlayerGui (ตัวใน Workspace เป็น template ที่ไม่แสดงผล)
+    for _, name in ipairs({ "HeatFrame", "SummerFrame" }) do
+        local frame = gui:FindFirstChild(name)
+        if frame and frame:IsA("LayerCollector") then
+            local enabled = false
+            pcall(function()
+                enabled = frame.Enabled == true
+            end)
+            if enabled then
+                local background = frame:FindFirstChild("Background")
+                local open = background == nil
+                if background and background:IsA("GuiObject") then
+                    local visible = false
+                    local backgroundTransparency = 1
+                    local imageTransparency = 1
+                    pcall(function()
+                        visible = background.Visible == true
+                        backgroundTransparency = numberOr(background.BackgroundTransparency, 1)
+                        if background:IsA("ImageLabel") or background:IsA("ImageButton") then
+                            imageTransparency = numberOr(background.ImageTransparency, 1)
+                        end
+                    end)
+                    open = visible and (backgroundTransparency < 0.95 or imageTransparency < 0.95)
+                end
+                if open then
+                    local banner = frame:FindFirstChild("Banner")
+                    local title = GameContext.text(banner and banner:FindFirstChild("Title", true))
+                    if not title then
+                        title = GameContext.text(frame:FindFirstChild("Title", true))
+                    end
+                    if title then
+                        return {
+                            values = { event = title },
+                            sources = { event = "แผง Event ใน PlayerGui" },
+                            notes = { event = "ชื่อ Event ที่แผงเกมเปิดอยู่แสดง" },
+                            fresh = true,
+                        }
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function GameContext.addField(snapshot, key, value, source, note)
+    if type(value) ~= "string" then
+        return
+    end
+    value = trimText((value:gsub("%s+", " ")))
+    if value == "" then
+        return
+    end
+    if #value > GAME_CONTEXT_TEXT_LIMIT then
+        value = value:sub(1, GAME_CONTEXT_TEXT_LIMIT)
+    end
+    if snapshot[key] and string.lower(snapshot[key]) ~= string.lower(value) then
+        snapshot.conflicts[key] = tostring(snapshot[key]) .. " / " .. value
+        return
+    end
+    snapshot[key] = value
+    if type(source) == "string" then
+        snapshot.sources[key] = source
+    end
+    if type(note) == "string" then
+        snapshot.notes[key] = note
+    end
+end
+
+function GameContext.capture()
+    local snapshot = {
+        capturedAt = os.time(),
+        verified = false,
+        status = "unknown",
+        map = nil,
+        mode = nil,
+        event = nil,
+        difficulty = nil,
+        act = nil,
+        wave = nil,
+        sources = {},
+        notes = {},
+        conflicts = {},
+    }
+
+    local function merge(pack)
+        if type(pack) ~= "table" then
+            return
+        end
+        local values = pack.values or pack
+        for _, key in ipairs(GameContext.fields) do
+            GameContext.addField(
+                snapshot,
+                key,
+                values[key],
+                pack.sources and pack.sources[key],
+                pack.notes and pack.notes[key]
+            )
+        end
+    end
+
+    local menu = GameContext.readMenu()
+    merge(menu)
+    merge(GameContext.readResult())
+    merge(GameContext.readEventPanel())
+    merge(GameContext.readWave())
+
+    local detected = 0
+    local identityConflict = false
+    for _, key in ipairs(GameContext.fields) do
+        if snapshot[key] then
+            detected += 1
+        end
+        if (key == "map" or key == "mode") and snapshot.conflicts[key] then
+            identityConflict = true
+        end
+    end
+    if detected == 0 then
+        snapshot.status = "unknown"
+    elseif snapshot.map and snapshot.mode then
+        snapshot.status = "detected"
+    else
+        snapshot.status = "partial"
+    end
+    if menu and snapshot.map and snapshot.mode and not identityConflict then
+        snapshot.verified = true
+    end
+    return snapshot
+end
+
+function GameContext.safeCapture()
+    local ok, snapshot = pcall(GameContext.capture)
+    if ok and type(snapshot) == "table" then
+        return snapshot
+    end
+    return {
+        capturedAt = os.time(),
+        verified = false,
+        status = "unknown",
+        sources = {},
+        notes = {},
+        conflicts = {},
+    }
+end
+
+function GameContext.mergeContexts(base, extra)
+    if type(base) ~= "table" then
+        return extra
+    end
+    if type(extra) ~= "table" then
+        return base
+    end
+
+    local merged = {
+        capturedAt = math.max(numberOr(base.capturedAt, 0), numberOr(extra.capturedAt, 0)),
+        verified = base.verified == true or extra.verified == true,
+        status = "unknown",
+        map = nil,
+        mode = nil,
+        event = nil,
+        difficulty = nil,
+        act = nil,
+        wave = nil,
+        sources = {},
+        notes = {},
+        conflicts = {},
+    }
+
+    for _, sourceContext in ipairs({ base, extra }) do
+        for _, key in ipairs(GameContext.fields) do
+            if key ~= "wave" then
+                local value = type(sourceContext[key]) == "string" and sourceContext[key] or nil
+                local source = type(sourceContext.sources) == "table" and sourceContext.sources[key] or nil
+                local note = type(sourceContext.notes) == "table" and sourceContext.notes[key] or nil
+                GameContext.addField(merged, key, value, source, note)
+            end
+        end
+        if type(sourceContext.conflicts) == "table" then
+            for key, value in pairs(sourceContext.conflicts) do
+                if key ~= "wave" then
+                    merged.conflicts[key] = tostring(value)
+                end
+            end
+        end
+    end
+
+    -- Wave เปลี่ยนตลอดระหว่างเล่น: ใช้ค่าล่าสุดแทนการฟันธงว่าขัดแย้ง
+    local waveContext = nil
+    if type(extra.wave) == "string" and extra.wave ~= "" then
+        waveContext = extra
+    elseif type(base.wave) == "string" and base.wave ~= "" then
+        waveContext = base
+    end
+    if waveContext then
+        GameContext.addField(
+            merged,
+            "wave",
+            waveContext.wave,
+            type(waveContext.sources) == "table" and waveContext.sources.wave or nil,
+            type(waveContext.notes) == "table" and waveContext.notes.wave or nil
+        )
+        merged.conflicts.wave = nil
+    end
+
+    local detected = 0
+    for _, key in ipairs(GameContext.fields) do
+        if merged[key] then
+            detected += 1
+        end
+    end
+    if detected == 0 then
+        merged.status = "unknown"
+    elseif merged.map and merged.mode then
+        merged.status = "detected"
+    else
+        merged.status = "partial"
+    end
+    merged.verified = merged.verified == true and merged.map ~= nil and merged.mode ~= nil
+    for key in pairs(merged.conflicts) do
+        if key == "map" or key == "mode" then
+            merged.verified = false
+        end
+    end
+    return merged
+end
+
+function GameContext.formatStored(context, compact)
+    if type(context) ~= "table" then
+        return "ยังไม่มีข้อมูลบริบทที่เก็บไว้"
+    end
+    local function part(value)
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+        return "Unknown"
+    end
+    if compact then
+        local text = string.format(
+            "แมพ: %s • โหมด: %s • Wave %s",
+            part(context.map),
+            part(context.mode),
+            part(context.wave)
+        )
+        if not context.map or not context.mode then
+            text = text .. " • ยังไม่ยืนยัน"
+        end
+        if #text > 96 then
+            text = text:sub(1, 93) .. "..."
+        end
+        return text
+    end
+    return string.format(
+        "แมพ: %s • โหมด: %s • Event/Raid: %s • ความยาก: %s • Act/Stage: %s • Wave: %s",
+        part(context.map),
+        part(context.mode),
+        part(context.event),
+        part(context.difficulty),
+        part(context.act),
+        part(context.wave)
+    )
+end
+
+function GameContext.normalize(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local text = trimText((value:gsub("%s+", " ")))
+    if text == "" then
+        return nil
+    end
+    text = trimText((text:gsub("^%s*%d+%.%s*", "")))
+    if text == "" then
+        return nil
+    end
+    return string.lower(text)
+end
+
+function GameContext.preflight(stored, current)
+    current = current or GameContext.safeCapture()
+    local result = {
+        current = current,
+        blocked = {},
+        warnings = {},
+        missing = {},
+        needsConfirm = false,
+        summary = "",
+    }
+    local function get(context, key)
+        if type(context) ~= "table" then
+            return nil
+        end
+        local value = context[key]
+        if type(value) ~= "string" then
+            return nil
+        end
+        value = trimText(value)
+        if value == "" then
+            return nil
+        end
+        return value
+    end
+    local function same(a, b)
+        local left = GameContext.normalize(a)
+        local right = GameContext.normalize(b)
+        return left ~= nil and right ~= nil and left == right
+    end
+
+    if type(stored) ~= "table" then
+        result.warnings[#result.warnings + 1] = "Macro นี้ยังไม่มีข้อมูลบริบทเกมที่เก็บไว้"
+        result.missing[#result.missing + 1] = "แมพ, โหมด"
+        result.needsConfirm = true
+    else
+        for _, item in ipairs({ { "map", "แมพ" }, { "mode", "โหมด" } }) do
+            local key = item[1]
+            local label = item[2]
+            local storedValue = get(stored, key)
+            local currentValue = get(current, key)
+            if storedValue and currentValue then
+                if not same(storedValue, currentValue) then
+                    result.blocked[#result.blocked + 1] = string.format(
+                        "%sไม่ตรง (Macro: %s • ปัจจุบัน: %s)",
+                        label,
+                        storedValue,
+                        currentValue
+                    )
+                end
+            else
+                result.needsConfirm = true
+                local reason
+                if not storedValue and not currentValue then
+                    reason = "Macro ไม่มีข้อมูล และเกมไม่ได้แสดงตอนนี้"
+                elseif not storedValue then
+                    reason = "Macro ไม่มีข้อมูล"
+                else
+                    reason = "เกมไม่ได้แสดงตอนนี้"
+                end
+                result.missing[#result.missing + 1] = label .. " (" .. reason .. ")"
+                result.warnings[#result.warnings + 1] = label .. ": " .. reason
+            end
+        end
+        for _, item in ipairs({ { "event", "Event/Raid" }, { "difficulty", "ความยาก" }, { "act", "Act/Stage" } }) do
+            local key = item[1]
+            local label = item[2]
+            local storedValue = get(stored, key)
+            local currentValue = get(current, key)
+            if storedValue and currentValue and not same(storedValue, currentValue) then
+                result.warnings[#result.warnings + 1] = string.format(
+                    "%sต่างจากที่เก็บไว้ (Macro: %s • ปัจจุบัน: %s)",
+                    label,
+                    storedValue,
+                    currentValue
+                )
+            end
+        end
+    end
+
+    local conflicts = current and current.conflicts
+    if type(conflicts) == "table" then
+        for _, item in ipairs({
+            { "map", "แมพ" },
+            { "mode", "โหมด" },
+            { "event", "Event/Raid" },
+            { "difficulty", "ความยาก" },
+            { "act", "Act/Stage" },
+        }) do
+            local value = conflicts[item[1]]
+            if value then
+                if item[1] == "map" or item[1] == "mode" then
+                    result.blocked[#result.blocked + 1] = item[2] .. "มีข้อมูลขัดแย้งกัน: " .. tostring(value)
+                else
+                    result.warnings[#result.warnings + 1] = item[2] .. "มีข้อมูลขัดแย้งกัน: " .. tostring(value)
+                end
+            end
+        end
+    end
+
+    if type(stored) == "table" and stored.verified ~= true and (get(stored, "map") or get(stored, "mode")) then
+        result.needsConfirm = true
+        result.warnings[#result.warnings + 1] = "บริบทที่เก็บไว้ไม่ได้ยืนยันจากเมนูเกม"
+    end
+
+    if #result.missing > 0 then
+        result.summary = "ยืนยันไม่ได้: " .. table.concat(result.missing, ", ")
+    elseif result.needsConfirm then
+        result.summary = "ยังยืนยันบริบทได้ไม่ครบ"
+    else
+        result.summary = "ตรวจบริบทแล้ว"
+    end
+    return result
+end
+
+function GameContext.buildBlockedMessage(gate)
+    local lines = { "ไม่เริ่มเล่น เพราะบริบทเกมไม่ตรงกับ Macro:" }
+    for _, item in ipairs(gate.blocked or {}) do
+        lines[#lines + 1] = "• " .. tostring(item)
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "กลับไปยังด่าน/โหมดที่ Macro บันทึกไว้ หรือบันทึก Macro ใหม่ในบริบทนี้"
+    return table.concat(lines, "\n")
+end
+
+function GameContext.buildConfirmMessage(gate, stored)
+    local first = "ยังยืนยันบริบทเกมไม่ได้"
+    if #(gate.missing or {}) > 0 then
+        first = first .. ": " .. table.concat(gate.missing, ", ")
+    end
+    local lines = { first }
+    local shown = 0
+    for _, warning in ipairs(gate.warnings or {}) do
+        if shown >= 3 then
+            break
+        end
+        lines[#lines + 1] = "• " .. tostring(warning)
+        shown += 1
+    end
+    lines[#lines + 1] = "Macro: " .. GameContext.formatStored(stored, true)
+    lines[#lines + 1] = "เกมไม่เปิดเผยชื่อแมพระหว่างเล่น — เล่นต่อเฉพาะเมื่อแน่ใจว่าอยู่ด่าน/โหมดเดียวกัน"
+    return table.concat(lines, "\n")
+end
+
+function GameContext.buildUI(parent)
+    local _, body = makeCard(parent, "สถานะเกมปัจจุบัน")
+    UI.refs.gameContextRows = {}
+    for _, key in ipairs({ "map", "mode", "event", "difficulty" }) do
+        UI.refs.gameContextRows[key] = makeLabel(
+            body,
+            GameContext.labels[key] .. ": กำลังตรวจ...",
+            11,
+            Theme.muted,
+            UDim2.new(1, 0, 0, 16)
+        )
+    end
+    UI.refs.gameContextRows.actWave = makeLabel(
+        body,
+        "Act/Stage: ... • Wave: ...",
+        11,
+        Theme.muted,
+        UDim2.new(1, 0, 0, 16)
+    )
+    UI.refs.gameContextStatus = makeLabel(
+        body,
+        "สถานะ: กำลังตรวจ... • อัปเดตล่าสุด: -",
+        10,
+        Theme.muted,
+        UDim2.new(1, 0, 0, 16)
+    )
+    makeWrappedLabel(
+        body,
+        "ตรวจจาก GUI/ข้อความที่เกมแสดงจริงเท่านั้น • ชื่อแมพระหว่างเล่นเกมไม่เปิดเผย จึงแสดง Unknown และไม่เดา • เปิดเมนู MissionsV2 เพื่อให้ตรวจแมพ/โหมดได้",
+        9,
+        Theme.muted,
+        32
+    )
+end
+
+function GameContext.refreshUI(snapshot)
+    local rows = UI.refs.gameContextRows
+    if not rows then
+        return
+    end
+    snapshot = snapshot or GameContext.current
+
+    local function setRow(key, text, color)
+        local label = rows[key]
+        if label then
+            label.Text = text
+            label.TextColor3 = color
+        end
+    end
+
+    if not snapshot then
+        setRow("map", "แมพ: กำลังตรวจ...", Theme.muted)
+        setRow("mode", "โหมด: กำลังตรวจ...", Theme.muted)
+        setRow("event", "Event/Raid: กำลังตรวจ...", Theme.muted)
+        setRow("difficulty", "ความยาก: กำลังตรวจ...", Theme.muted)
+        setRow("actWave", "Act/Stage: ... • Wave: ...", Theme.muted)
+        if UI.refs.gameContextStatus then
+            UI.refs.gameContextStatus.Text = "สถานะ: กำลังตรวจ... • อัปเดตล่าสุด: -"
+            UI.refs.gameContextStatus.TextColor3 = Theme.muted
+        end
+        return
+    end
+
+    for _, key in ipairs({ "map", "mode", "event", "difficulty" }) do
+        local value = snapshot[key]
+        local source = snapshot.sources and snapshot.sources[key]
+        local conflict = snapshot.conflicts and snapshot.conflicts[key]
+        if conflict then
+            setRow(
+                key,
+                GameContext.labels[key] .. ": ข้อมูลขัดแย้งกัน (" .. tostring(conflict) .. ")",
+                Theme.warning
+            )
+        elseif value then
+            local suffix = source and ("  [" .. tostring(source) .. "]") or ""
+            setRow(key, GameContext.labels[key] .. ": ตรวจพบ — " .. tostring(value) .. suffix, Theme.text)
+        else
+            setRow(key, GameContext.labels[key] .. ": Unknown — ยังตรวจจับไม่ได้", Theme.muted)
+        end
+    end
+
+    local act = snapshot.act
+    local wave = snapshot.wave
+    local actConflict = snapshot.conflicts and snapshot.conflicts.act
+    local waveConflict = snapshot.conflicts and snapshot.conflicts.wave
+    local actText = act and ("ตรวจพบ — " .. tostring(act)) or "Unknown — ยังตรวจจับไม่ได้"
+    local waveText = wave and ("ตรวจพบ — " .. tostring(wave)) or "Unknown — ยังตรวจจับไม่ได้"
+    if actConflict then
+        actText = "ข้อมูลขัดแย้งกัน"
+    end
+    if waveConflict then
+        waveText = "ข้อมูลขัดแย้งกัน"
+    end
+    setRow(
+        "actWave",
+        "Act/Stage: " .. actText .. " • Wave: " .. waveText,
+        (actConflict or waveConflict) and Theme.warning or ((act or wave) and Theme.text or Theme.muted)
+    )
+
+    if UI.refs.gameContextStatus then
+        local detected = 0
+        local conflict = false
+        for _, key in ipairs(GameContext.fields) do
+            if snapshot[key] then
+                detected += 1
+            end
+            if snapshot.conflicts and snapshot.conflicts[key] then
+                conflict = true
+            end
+        end
+        local stateText
+        local complete = snapshot.map ~= nil and snapshot.mode ~= nil
+        if conflict then
+            stateText = "ข้อมูลขัดแย้งกัน"
+        elseif detected == 0 then
+            stateText = "ยังตรวจจับไม่ได้"
+        elseif complete then
+            stateText = "ตรวจพบแมพ/โหมดจากเมนู"
+        else
+            stateText = "ตรวจได้บางส่วน — ฟิลด์ที่เหลือ Unknown"
+        end
+        local timeText = snapshot.capturedAt and os.date("%H:%M:%S", snapshot.capturedAt) or "-"
+        UI.refs.gameContextStatus.Text = string.format("สถานะ: %s • อัปเดตล่าสุด: %s", stateText, timeText)
+        UI.refs.gameContextStatus.TextColor3 = conflict and Theme.warning
+            or (complete and Theme.success or (detected > 0 and Theme.warning or Theme.muted))
+    end
+end
+
+function GameContext.poll(force)
+    local now = clock()
+    if force ~= true and now - (GameContext.lastPollAt or 0) < GameContext.pollInterval then
+        return
+    end
+    GameContext.lastPollAt = now
+    local snapshot = GameContext.safeCapture()
+    GameContext.current = snapshot
+    if State.mode == "recording" and snapshot.status ~= "unknown" then
+        -- เก็บบริบทที่เกมเปิดเผยระหว่างบันทึก เช่น เปิดเมนู MissionsV2 ระหว่างเล่น
+        State.recordingContext = GameContext.mergeContexts(State.recordingContext, snapshot)
+    end
+    pcall(GameContext.refreshUI, snapshot)
 end
 
 -- ============================================================================
@@ -3981,6 +4861,7 @@ local function buildUI()
         UI.refs.macroProfileName = makeLabel(body, "ยังไม่มีโปรไฟล์", 17, Theme.text, UDim2.new(1, 0, 0, 24))
         UI.refs.macroName = makeLabel(body, "ยังไม่มี Macro", 13, Theme.accent, UDim2.new(1, 0, 0, 20))
         UI.refs.macroProfileMeta = makeLabel(body, "0 ขั้นตอน • 0:00", 11, Theme.muted, UDim2.new(1, 0, 0, 16))
+        UI.refs.macroContext = makeWrappedLabel(body, "บริบท: ยังไม่มีข้อมูล", 9, Theme.muted, 26)
 
         local row = makeButtonRow(body)
         makeButton(row, "จัดการโปรไฟล์", UDim2.new(0.5, -4, 1, 0), Theme.panel3, function()
@@ -4072,6 +4953,8 @@ local function buildUI()
 
         makeWrappedLabel(body, "ปุ่มหยุดปกติอยู่ข้างปุ่มเล่น • ซ่อนเมนูได้โดยงานเบื้องหลังไม่หยุด • F8 เป็นทางลัดหยุดฉุกเฉินที่ซ่อนไว้", 10, Theme.muted, 32)
     end
+
+    GameContext.buildUI(macroPage)
 
     do
         local _, body = makeCard(macroPage, "ขั้นตอนที่บันทึก")
@@ -4919,6 +5802,12 @@ function App.refreshProfileSummary()
     if UI.refs.macroProfileMeta then
         UI.refs.macroProfileMeta.Text = metaText
     end
+    if UI.refs.macroContext then
+        local context = macro and macro.context or nil
+        UI.refs.macroContext.Text = "บริบท: " .. GameContext.formatStored(context, true)
+        local incomplete = type(context) == "table" and (not context.map or not context.mode)
+        UI.refs.macroContext.TextColor3 = incomplete and Theme.warning or Theme.muted
+    end
     if UI.refs.selectedProfileName then
         UI.refs.selectedProfileName.Text = name
     end
@@ -5159,7 +6048,7 @@ function App.refreshMacros()
     for _, macro in ipairs(data.macros) do
         local selected = macro.id == data.selectedMacroId
         local isMain = macro.id == data.mainMacroId
-        local row = makeButton(scroll, "", UDim2.new(1, -4, 0, 54), selected and Theme.panel2 or Theme.panel, function()
+        local row = makeButton(scroll, "", UDim2.new(1, -4, 0, 66), selected and Theme.panel2 or Theme.panel, function()
             App.selectMacro(macro.id)
         end, { textSize = 11 })
         if selected then
@@ -5173,9 +6062,13 @@ function App.refreshMacros()
         local setStatus = macro.set and macro.set.status or "none"
         local setText = setStatus == "detected" and "set: detected" or (setStatus == "input-only" and "set: input-only" or "set: -")
         local metaLabel = makeLabel(row, string.format("%d ขั้นตอน • %s • %s", #macro.events, formatDuration(macro.duration or 0), setText), 9, Theme.muted, UDim2.new(1, -78, 0, 16))
-        metaLabel.Position = UDim2.fromOffset(10, 28)
+        metaLabel.Position = UDim2.fromOffset(10, 26)
 
-        local stateLabel = makeLabel(row, isMain and "หลัก" or (selected and "ใช้งาน" or "เลือก"), 9, isMain and Theme.warning or (selected and Theme.accent or Theme.muted), UDim2.fromOffset(62, 54), Enum.TextXAlignment.Right)
+        local contextIncomplete = type(macro.context) == "table" and (not macro.context.map or not macro.context.mode)
+        local contextLabel = makeLabel(row, "บริบท: " .. GameContext.formatStored(macro.context, true), 9, contextIncomplete and Theme.warning or Theme.muted, UDim2.new(1, -78, 0, 14))
+        contextLabel.Position = UDim2.fromOffset(10, 43)
+
+        local stateLabel = makeLabel(row, isMain and "หลัก" or (selected and "ใช้งาน" or "เลือก"), 9, isMain and Theme.warning or (selected and Theme.accent or Theme.muted), UDim2.fromOffset(62, 66), Enum.TextXAlignment.Right)
         stateLabel.Position = UDim2.new(1, -70, 0, 0)
     end
 
@@ -6310,6 +7203,7 @@ function Rec.makePendingRecording(events, set, screen)
         profileName = meta and meta.name or nil,
         recordedAt = os.time(),
         screen = screen or State.recordViewport or { w = getViewport().X, h = getViewport().Y },
+        context = GameContext.mergeContexts(State.recordingContext, GameContext.safeCapture()),
         source = "recording",
     }
 end
@@ -6339,6 +7233,7 @@ end
 function Rec.startRecordingNow()
     State.token += 1
     local token = State.token
+    State.recordingContext = GameContext.safeCapture()
     State.mode = "countdown"
     State.events = {}
     State.recordStart = 0
@@ -6383,6 +7278,7 @@ function Rec.startRecordingNow()
             return
         end
 
+        State.recordingContext = GameContext.mergeContexts(State.recordingContext, GameContext.safeCapture())
         State.mode = "recording"
         State.recordStart = clock()
         State.lastMoveSample = 0
@@ -6718,6 +7614,7 @@ function App.commitPendingRecording(pending, name, overwriteId)
         target.events = pending.events
         target.set = pending.set
         target.screen = pending.screen
+        target.context = sanitizeGameContext(pending.context)
         target.modified = os.time()
     else
         target = {
@@ -6728,6 +7625,7 @@ function App.commitPendingRecording(pending, name, overwriteId)
             events = pending.events,
             set = pending.set,
             screen = pending.screen,
+            context = sanitizeGameContext(pending.context),
         }
         table.insert(data.macros, 1, target)
     end
@@ -6770,6 +7668,7 @@ function App.commitPendingRecording(pending, name, overwriteId)
         formatDuration(target.duration),
         target.set and target.set.status or "ไม่มี"
     ))
+    Log.add("info", "บริบทที่เก็บกับ Macro: " .. GameContext.formatStored(target.context, true))
     App.refreshProfiles()
     Rec.updateRecordInfo()
     return true
@@ -6780,6 +7679,7 @@ function App.stopRecording()
         State.token += 1
         State.mode = "idle"
         State.events = {}
+        State.recordingContext = nil
         State.playbackIndex = 0
         State.loop = 0
         if not State.pendingRecording then
@@ -6809,6 +7709,7 @@ function App.stopRecording()
     State.finished = false
 
     if #events == 0 then
+        State.recordingContext = nil
         Recovery.clear()
         setStatus("ไม่ได้บันทึกขั้นตอน", "warn")
         Log.add("warn", "หยุดบันทึกแต่ไม่มีขั้นตอนใดถูกบันทึก")
@@ -6820,6 +7721,7 @@ function App.stopRecording()
     local set = Rec.buildInferredSet(events)
     local pending = Rec.makePendingRecording(events, set, State.recordViewport)
     State.pendingRecording = pending
+    State.recordingContext = nil
     Recovery.write(pending)
 
     local worldClicks = 0
@@ -8404,6 +9306,41 @@ function App.startPlayback(options)
     end
 
     local macro = selectedMacro()
+    if macro and options.contextConfirmed ~= true then
+        local gateOk, gate = pcall(GameContext.preflight, macro.context)
+        if not gateOk then
+            Log.add("warn", "ตรวจบริบทเกมก่อนเล่นไม่สำเร็จ: " .. tostring(gate))
+        elseif type(gate) == "table" then
+            if #gate.blocked > 0 then
+                local message = GameContext.buildBlockedMessage(gate)
+                setStatus("บริบทเกมไม่ตรงกับ Macro", "error")
+                Log.add("error", "ไม่เริ่มเล่น — " .. table.concat(gate.blocked, " • "))
+                showNotice("บริบทเกมไม่ตรง", message)
+                return false
+            end
+            for _, warning in ipairs(gate.warnings) do
+                Log.add("warn", "บริบทเกม: " .. tostring(warning))
+            end
+            if gate.needsConfirm then
+                if options.fromAuto then
+                    Log.add("warn", "Auto เล่นต่อทั้งที่ยังยืนยันบริบทไม่ได้: " .. tostring(gate.summary))
+                else
+                    showConfirm(
+                        "ยังยืนยันบริบทเกมไม่ได้",
+                        GameContext.buildConfirmMessage(gate, macro.context),
+                        "เล่นต่อ",
+                        function()
+                            App.startPlayback({ contextConfirmed = true, fromAuto = false })
+                        end,
+                        false,
+                        nil,
+                        190
+                    )
+                    return false
+                end
+            end
+        end
+    end
     State.playbackScale = buildScale(macro)
     State.token += 1
     local token = State.token
@@ -9124,6 +10061,7 @@ function App.promptResetMacro()
             macro.events = {}
             macro.set = nil
             macro.screen = nil
+            macro.context = nil
             macro.count = 0
             macro.duration = 0
             macro.modified = os.time()
@@ -9878,6 +10816,18 @@ end
 RuntimeHandle.getAdapterStatus = function()
     return App.getAdapterStatus()
 end
+RuntimeHandle.getGameContext = function()
+    return GameContext.current
+end
+RuntimeHandle.captureGameContext = function()
+    return GameContext.safeCapture()
+end
+RuntimeHandle.preflightGameContext = function(stored, current)
+    return GameContext.preflight(stored, current)
+end
+RuntimeHandle.mergeGameContext = function(base, extra)
+    return GameContext.mergeContexts(base, extra)
+end
 RuntimeHandle.notifyDuplicate = function()
     setMenuVisible(true)
     showNotice(
@@ -9991,6 +10941,7 @@ task.spawn(function()
             break
         end
 
+        GameContext.poll()
         Auto.tick()
 
         if Settings.afkEnabled and Cap.afk and Input.available() then
@@ -10013,6 +10964,7 @@ App.refreshProfiles()
 App.refreshSettingsUI()
 App.refreshTransport()
 Rec.updateRecordInfo()
+GameContext.poll(true)
 
 if Cap.input == "none" then
     setStatus("ไม่พบ API อินพุต", "error")
