@@ -68,7 +68,7 @@ local LocalPlayer = Players.LocalPlayer
 local APP_NAME = "ASTD Macro"
 local APP_VERSION = "2.0.1"
 -- ใช้ตรวจว่าโหลดสคริปต์รุ่นล่าสุดจาก raw link จริง (ไม่เปลี่ยนเลขเวอร์ชัน)
-local APP_BUILD = "2026-10-27.3"
+local APP_BUILD = "2026-10-27.4"
 local GUI_NAME = "ASTD_Macro_Menu"
 
 local ROOT_DIR = "ASTD_Macro"
@@ -1184,6 +1184,7 @@ local State: any = {
     playbackEvents = nil,
     worldFallbackWarned = false,
     worldProjectionFallbackWarned = false,
+    worldThroughWarned = false,
     guiFallbackWarned = false,
     screenClickWarned = false,
     strictGuiWarned = false,
@@ -9378,10 +9379,13 @@ local function resolveWorldEventPoint(event)
         end
     end
     if not verified and verifyInfo and verifyInfo.kind == "occupied" and Settings.worldThrough == true then
-        Log.add("warn", string.format(
-            "จุดวางมี %s อยู่ — คลิกตามพิกัดเดิมเพราะเปิดตัวเลือกคลิกผ่านวัตถุ (อาจคลิกถูกวัตถุแทนการวาง)",
-            worldHitLabel(verifyInfo.current)
-        ))
+        if not State.worldThroughWarned then
+            State.worldThroughWarned = true
+            Log.add("warn", string.format(
+                "จุดวางมี %s อยู่ — คลิกตามพิกัดเดิมเพราะเปิด \"คลิกจุดวางเดิมแม้มีวัตถุอยู่บนจุด\" (อาจคลิกถูกวัตถุแทนการวาง) • จะแจ้งครั้งเดียวต่อการเล่น",
+                worldHitLabel(verifyInfo.current)
+            ))
+        end
         verified = true
     end
     if not verified then
@@ -10057,6 +10061,7 @@ function App.startPlayback(options)
     State.playbackEvents = events
     State.worldFallbackWarned = false
     State.worldProjectionFallbackWarned = false
+    State.worldThroughWarned = false
     State.guiFallbackWarned = false
     State.screenClickWarned = false
     State.strictGuiWarned = false
