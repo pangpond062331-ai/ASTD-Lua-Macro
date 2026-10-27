@@ -67,6 +67,8 @@ local LocalPlayer = Players.LocalPlayer
 
 local APP_NAME = "ASTD Macro"
 local APP_VERSION = "2.0.1"
+-- ใช้ตรวจว่าโหลดสคริปต์รุ่นล่าสุดจาก raw link จริง (ไม่เปลี่ยนเลขเวอร์ชัน)
+local APP_BUILD = "2026-10-27.2"
 local GUI_NAME = "ASTD_Macro_Menu"
 
 local ROOT_DIR = "ASTD_Macro"
@@ -11375,6 +11377,8 @@ RuntimeHandle.getCapabilities = function()
 end
 RuntimeHandle.getInput = function()
     return {
+        build = APP_BUILD,
+        version = APP_VERSION,
         backend = Input.backend,
         describe = Input.describe(),
         ready = Input.ready,
@@ -11448,7 +11452,7 @@ Input.init()
 App.apiStatus.input = Cap.input ~= "none"
 Log.add("info", "อินพุตที่ใช้: " .. Input.describe()
     .. (Input.isVirtual() and " (เมาส์จริงไม่ถูกย้าย)" or (Cap.input == "real" and " (เมาส์จริงจะขยับ)" or "")))
-print("[ASTD Macro] อินพุต: " .. Input.describe()
+print("[ASTD Macro] Build " .. APP_BUILD .. " • อินพุต: " .. Input.describe()
     .. (Input.isVirtual() and " • เมาส์จริงไม่ถูกย้าย" or (Cap.input == "real" and " • เมาส์จริงจะขยับ" or "")))
 if Cap.virtualInputError and not Cap.vimReady then
     Log.add("warn", "VirtualInput ไม่พร้อม: " .. tostring(Cap.virtualInputError))
