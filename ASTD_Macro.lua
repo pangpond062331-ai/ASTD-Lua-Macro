@@ -11328,6 +11328,8 @@ Input.init()
 App.apiStatus.input = Cap.input ~= "none"
 Log.add("info", "อินพุตที่ใช้: " .. Input.describe()
     .. (Input.isVirtual() and " (เมาส์จริงไม่ถูกย้าย)" or (Cap.input == "real" and " (เมาส์จริงจะขยับ)" or "")))
+print("[ASTD Macro] อินพุต: " .. Input.describe()
+    .. (Input.isVirtual() and " • เมาส์จริงไม่ถูกย้าย" or (Cap.input == "real" and " • เมาส์จริงจะขยับ" or "")))
 if Cap.virtualInputError and not Cap.vimReady then
     Log.add("warn", "VirtualInput ไม่พร้อม: " .. tostring(Cap.virtualInputError))
 end
