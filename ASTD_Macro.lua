@@ -2390,13 +2390,8 @@ local function virtualCall(methodName, ...)
 end
 
 local function inputLayerCollector()
-    local player = Players.LocalPlayer
-    if player then
-        local playerGui = player:FindFirstChildOfClass("PlayerGui")
-        if playerGui then
-            return playerGui
-        end
-    end
+    -- ตัวอย่างที่ใช้จริงในเกมส่วนใหญ่ส่ง game เป็น layerCollector
+    -- (PlayerGui อาจทำให้คลิกโลกไม่ถึงเกม)
     return game
 end
 
@@ -2594,7 +2589,7 @@ function Input.press(button)
                 mouseButton,
                 true,
                 inputLayerCollector(),
-                0
+                1
             )
         end)
         if not ok then
@@ -2655,7 +2650,7 @@ function Input.release(button)
                 mouseButton,
                 false,
                 inputLayerCollector(),
-                0
+                1
             )
         end)
         if not ok then
