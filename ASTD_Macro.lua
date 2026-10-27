@@ -68,7 +68,7 @@ local LocalPlayer = Players.LocalPlayer
 local APP_NAME = "ASTD Macro"
 local APP_VERSION = "2.0.1"
 -- ใช้ตรวจว่าโหลดสคริปต์รุ่นล่าสุดจาก raw link จริง (ไม่เปลี่ยนเลขเวอร์ชัน)
-local APP_BUILD = "2026-10-27.2"
+local APP_BUILD = "2026-10-27.3"
 local GUI_NAME = "ASTD_Macro_Menu"
 
 local ROOT_DIR = "ASTD_Macro"
@@ -231,6 +231,9 @@ end
 -- เก็บลายเซ็นของพื้นผิว/โมเดลที่ถูกคลิกด้วย เพื่อใช้ยืนยันตอนเล่นซ้ำ
 -- นี่เป็น best effort จาก camera raycast ไม่ใช่ข้อมูล placement cell/unit ID ของ ASTD
 local WORLD_MATCH_RADIUS = 4
+local WORLD_OCCUPIED_RADIUS = 6
+local WORLD_SCAN_RADIUS = 16
+local WORLD_SCAN_STEP = 4
 local WORLD_PATH_LIMIT = 240
 
 local function limitedText(value, maxLength)
@@ -1434,6 +1437,7 @@ local DEFAULT_SETTINGS = {
     recordMovementKeys = false,
     worldAnchor = true,
     worldFallback = false,
+    worldThrough = false,
     noMouseMove = true,
     scaleCoords = false,
     offsetX = 0,
@@ -1476,6 +1480,7 @@ local function loadSettings()
     Settings.recordMovementKeys = boolOr(data.recordMovementKeys, false)
     Settings.worldAnchor = boolOr(data.worldAnchor, true)
     Settings.worldFallback = boolOr(data.worldFallback, false)
+    Settings.worldThrough = boolOr(data.worldThrough, false)
     Settings.noMouseMove = boolOr(data.noMouseMove, true)
     Settings.scaleCoords = boolOr(data.scaleCoords, Settings.scaleCoords)
     Settings.offsetX = math.floor(math.clamp(numberOr(data.offsetX, Settings.offsetX), -1000, 1000))
@@ -1514,6 +1519,7 @@ local function saveSettings()
         recordMovementKeys = Settings.recordMovementKeys == true,
         worldAnchor = Settings.worldAnchor ~= false,
         worldFallback = Settings.worldFallback == true,
+        worldThrough = Settings.worldThrough == true,
         noMouseMove = Settings.noMouseMove ~= false,
         scaleCoords = Settings.scaleCoords,
         offsetX = Settings.offsetX,
@@ -5687,6 +5693,11 @@ local function buildUI()
             saveSettings()
         end)
 
+        UI.refs.worldThroughToggle = makeToggleRow(body, "คลิกจุดวางเดิมแม้มีวัตถุอยู่บนจุด", Settings.worldThrough == true, "ใช้เฉพาะเมื่อเกมวางซ้อนจุดเดิมได้ • เสี่ยงคลิกถูกยูนิตแทนการวาง • ค่าเริ่มต้นปิด", function(value)
+            Settings.worldThrough = value
+            saveSettings()
+        end)
+
         UI.refs.scaleCoordsToggle = makeToggleRow(body, "ปรับพิกัดตามขนาดหน้าจอ", Settings.scaleCoords, "ใช้เมื่อย้าย Macro ระหว่าง PC/มือถือ (ยังไม่ยืนยันความแม่นยำ)", function(value)
             Settings.scaleCoords = value
             saveSettings()
@@ -6690,6 +6701,9 @@ function App.refreshSettingsUI()
     end
     if UI.refs.worldFallbackToggle then
         UI.refs.worldFallbackToggle.set(Settings.worldFallback == true, false)
+    end
+    if UI.refs.worldThroughToggle then
+        UI.refs.worldThroughToggle.set(Settings.worldThrough == true, false)
     end
     if UI.refs.scaleCoordsToggle then
         UI.refs.scaleCoordsToggle.set(Settings.scaleCoords, false)
@@ -9139,69 +9153,160 @@ local function projectWorldPoint(world)
     return x, y
 end
 
+local function worldHitLabel(hitInfo)
+    if type(hitInfo) ~= "table" then
+        return "ไม่ทราบ"
+    end
+    return tostring(hitInfo.modelName or hitInfo.modelPath or hitInfo.name or hitInfo.path or hitInfo.class or "ไม่ทราบ")
+end
+
 local function verifyWorldHit(world, x, y)
     if type(world) ~= "table" then
-        return false, "ไม่มีข้อมูลตำแหน่งโลก"
+        return false, "ไม่มีข้อมูลตำแหน่งโลก", { kind = "invalid" }
     end
     local hit = raycastFromScreen(x, y, world.space)
     if not hit or not hit.Position then
-        return false, "ไม่พบพื้นผิวที่จุดคลิก"
+        return false, "ไม่พบพื้นผิวที่จุดคลิก", { kind = "none" }
     end
     local dx = hit.Position.X - numberOr(world.x, 0)
     local dy = hit.Position.Y - numberOr(world.y, 0)
     local dz = hit.Position.Z - numberOr(world.z, 0)
     local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    local horizontal = math.sqrt(dx * dx + dz * dz)
+    local current = describeWorldHit(hit)
+    local recorded = type(world.hit) == "table" and world.hit or nil
+    local info = {
+        hit = hit,
+        current = current,
+        distance = distance,
+        horizontal = horizontal,
+        dx = dx,
+        dy = dy,
+        dz = dz,
+        kind = "ok",
+    }
+
     if distance > WORLD_MATCH_RADIUS then
+        -- แยก "มีวัตถุอยู่บนจุดวาง" (กดแล้วจะโดนวัตถุ) ออกจาก "พื้นผิวเดิมหาย/ถูกย้าย"
+        local sameModel = recorded and recorded.modelPath and current
+            and current.modelPath == recorded.modelPath
+        if current and not current.isTerrain and not sameModel
+            and dy > WORLD_MATCH_RADIUS and horizontal <= WORLD_OCCUPIED_RADIUS then
+            info.kind = "occupied"
+            return false, string.format(
+                "จุดนี้มี %s อยู่บนจุดวาง (สูง %.1f สตัด) — ไม่คลิกทับ; เริ่มรอบใหม่/เคลียร์จุด หรือเปิด \"คลิกจุดวางเดิมแม้มีวัตถุอยู่บนจุด\"",
+                worldHitLabel(current),
+                distance
+            ), info
+        end
+        info.kind = "blocked"
         return false, string.format(
-            "ตำแหน่งโลกเปลี่ยนไป %.1f สตัด (เกิน %.1f) — ไม่คลิกเพื่อความปลอดภัย",
+            "ตำแหน่งโลกเปลี่ยนไป %.1f สตัด (เกิน %.1f) — จุดคลิกตอนนี้คือ %s",
             distance,
-            WORLD_MATCH_RADIUS
-        )
+            WORLD_MATCH_RADIUS,
+            worldHitLabel(current)
+        ), info
     end
 
-    local recorded = type(world.hit) == "table" and world.hit or nil
     if not recorded then
-        return true
+        return true, nil, info
     end
-    local current = describeWorldHit(hit)
     if not current then
-        return false, "อ่านลายเซ็นพื้นผิวปัจจุบันไม่ได้"
+        info.kind = "blocked"
+        return false, "อ่านลายเซ็นพื้นผิวปัจจุบันไม่ได้", info
     end
 
     if recorded.modelPath or recorded.modelName then
         if recorded.modelPath and not current.modelPath then
-            return false, "ไม่พบโมเดลเป้าหมายเดิมที่จุดคลิก"
+            info.kind = "moved"
+            return false, "ไม่พบโมเดลเป้าหมายเดิมที่จุดคลิก", info
         end
         if recorded.modelName and not current.modelName then
-            return false, "ไม่พบชื่อโมเดลเป้าหมายเดิมที่จุดคลิก"
+            info.kind = "moved"
+            return false, "ไม่พบชื่อโมเดลเป้าหมายเดิมที่จุดคลิก", info
         end
         if recorded.modelPath and current.modelPath and recorded.modelPath ~= current.modelPath then
+            info.kind = "moved"
             return false, string.format(
                 "โมเดลเป้าหมายเปลี่ยนจาก %s เป็น %s",
                 tostring(recorded.modelName or recorded.modelPath),
                 tostring(current.modelName or current.modelPath)
-            )
+            ), info
         end
         if recorded.modelName and current.modelName and recorded.modelName ~= current.modelName then
+            info.kind = "moved"
             return false, string.format(
                 "ชื่อโมเดลเป้าหมายเปลี่ยนจาก %s เป็น %s",
                 tostring(recorded.modelName),
                 tostring(current.modelName)
-            )
+            ), info
         end
-        return true
+        return true, nil, info
     end
 
     if recorded.path and current.path and recorded.path ~= current.path then
-        return false, "พื้นผิวเป้าหมายเปลี่ยนจาก " .. tostring(recorded.path) .. " เป็น " .. tostring(current.path)
+        info.kind = "moved"
+        return false, "พื้นผิวเป้าหมายเปลี่ยนจาก " .. tostring(recorded.path) .. " เป็น " .. tostring(current.path), info
     end
     if recorded.name and current.name and recorded.name ~= current.name then
-        return false, "ชื่อพื้นผิวเป้าหมายเปลี่ยนจาก " .. tostring(recorded.name) .. " เป็น " .. tostring(current.name)
+        info.kind = "moved"
+        return false, "ชื่อพื้นผิวเป้าหมายเปลี่ยนจาก " .. tostring(recorded.name) .. " เป็น " .. tostring(current.name), info
     end
     if recorded.class and current.class and recorded.class ~= current.class then
-        return false, "ชนิดพื้นผิวเป้าหมายเปลี่ยนจาก " .. tostring(recorded.class) .. " เป็น " .. tostring(current.class)
+        info.kind = "moved"
+        return false, "ชนิดพื้นผิวเป้าหมายเปลี่ยนจาก " .. tostring(recorded.class) .. " เป็น " .. tostring(current.class), info
     end
-    return true
+    return true, nil, info
+end
+
+local function isOwnOrGameGuiAt(x, y)
+    if pointInGui(Vector2.new(x, y)) then
+        return true, "own"
+    end
+    local target, _, checked, ownBlocked = GuiTargeting.guiTargetAt(x, y)
+    if ownBlocked then
+        return true, "own"
+    end
+    if target then
+        return true, tostring(target.fullName or target.className or "GUI")
+    end
+    if not checked then
+        return true, "unknown"
+    end
+    return false, nil
+end
+
+-- ค้นหาพิกเซลใกล้ ๆ ที่ยังยิงโดนพื้นผิวเป้าหมายเดิม (ภายในรัศมีที่ยอมรับ)
+-- ใช้เมื่อจุดเดิมถูกบังบางส่วน โดยไม่หมุนกล้องและไม่เปลี่ยนไปคลิกวัตถุที่บัง
+local function findVisibleWorldPoint(world, x, y)
+    local viewport = getViewport()
+    local candidates = {}
+    for offsetY = -WORLD_SCAN_RADIUS, WORLD_SCAN_RADIUS, WORLD_SCAN_STEP do
+        for offsetX = -WORLD_SCAN_RADIUS, WORLD_SCAN_RADIUS, WORLD_SCAN_STEP do
+            local distance = math.sqrt(offsetX * offsetX + offsetY * offsetY)
+            if distance > 0 and distance <= WORLD_SCAN_RADIUS then
+                table.insert(candidates, { x = offsetX, y = offsetY, d = distance })
+            end
+        end
+    end
+    table.sort(candidates, function(a, b)
+        return a.d < b.d
+    end)
+
+    for _, candidate in ipairs(candidates) do
+        local cx = x + candidate.x
+        local cy = y + candidate.y
+        if cx >= 0 and cy >= 0 and cx <= viewport.X and cy <= viewport.Y then
+            local verified, _, info = verifyWorldHit(world, cx, cy)
+            if verified and info and info.distance <= WORLD_MATCH_RADIUS then
+                local blocked = isOwnOrGameGuiAt(cx, cy)
+                if not blocked then
+                    return cx, cy, info, candidate.d
+                end
+            end
+        end
+    end
+    return nil, nil, nil, nil
 end
 
 local function resolveWorldEventPoint(event)
@@ -9246,7 +9351,39 @@ local function resolveWorldEventPoint(event)
     if not checked then
         return nil, nil, "ตรวจสอบ GUI ไม่ได้ จึงยืนยันไม่ได้ว่าจุดโลกไม่ถูก UI บัง"
     end
-    local verified, verifyError = verifyWorldHit(event.world, x, y)
+    local verified, verifyError, verifyInfo = verifyWorldHit(event.world, x, y)
+    if not verified then
+        -- เกมบางเกมใช้ preview/ghost ที่ขยับตามเมาส์: ต้องเลื่อนเมาส์เสมือนไปก่อน
+        -- แล้วรอหนึ่งเฟรมจึงตรวจซ้ำ ไม่งั้นจะเห็นวัตถุเก่าที่ตำแหน่งเมาส์เดิม
+        local moved, moveError = Input.move(x, y)
+        if not moved then
+            return nil, nil, "เลื่อนเมาส์เพื่อตรวจสอบจุดโลกไม่สำเร็จ: " .. tostring(moveError)
+        end
+        task.wait()
+        verified, verifyError, verifyInfo = verifyWorldHit(event.world, x, y)
+    end
+    if not verified then
+        -- ถ้าจุดเดิมถูกบังเพียงบางส่วน ให้หาพิกเซลใกล้ ๆ ที่ยังโดนพื้นผิวเดิม
+        -- โดยจำกัดระยะในโลกไม่เกิน WORLD_MATCH_RADIUS และไม่ทับ GUI เกม
+        local nx, ny, nearInfo, shift = findVisibleWorldPoint(event.world, x, y)
+        if nx then
+            Log.add("warn", string.format(
+                "จุดคลิกเดิมถูกบังบางส่วน — เลื่อนจุดคลิก %.0f px (ห่างจากจุดเดิม %.2f สตัด) แต่ยังอยู่บนพื้นผิวเป้าหมาย",
+                shift,
+                nearInfo.distance
+            ))
+            x, y = nx, ny
+            verifyInfo = nearInfo
+            verified = true
+        end
+    end
+    if not verified and verifyInfo and verifyInfo.kind == "occupied" and Settings.worldThrough == true then
+        Log.add("warn", string.format(
+            "จุดวางมี %s อยู่ — คลิกตามพิกัดเดิมเพราะเปิดตัวเลือกคลิกผ่านวัตถุ (อาจคลิกถูกวัตถุแทนการวาง)",
+            worldHitLabel(verifyInfo.current)
+        ))
+        verified = true
+    end
     if not verified then
         return nil, nil, verifyError
     end
