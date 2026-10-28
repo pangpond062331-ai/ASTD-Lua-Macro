@@ -25,35 +25,82 @@ if type(getgenv) == "function" then
     end
 end
 
--- ห้ามสร้างอินสแตนซ์ซ้ำ: ถ้าตัวเดิมยังทำงานอยู่ ให้เปิดเมนูเดิมและจบสคริปต์ใหม่ทันที
-local oldInstance = GENV.__ASTD_MACRO
-if type(oldInstance) == "table" then
-    local oldAlive = oldInstance.alive
-    if oldAlive ~= false then
-        if type(oldInstance.notifyDuplicate) == "function" then
-            pcall(oldInstance.notifyDuplicate)
-            print("[ASTD Macro] พบอินสแตนซ์ที่ทำงานอยู่ — ไม่โหลดซ้ำ")
-            return
+local APP_NAME = "ASTD Macro"
+local APP_VERSION = "2.0.1"
+-- ใช้ตรวจว่าโหลดสคริปต์รุ่นล่าสุดจาก raw link จริง (ไม่เปลี่ยนเลขเวอร์ชัน)
+local APP_BUILD = "2026-10-28.1"
+local GUI_NAME = "ASTD_Macro_Menu"
+
+-- พิมพ์ตั้งแต่ต้นสคริปต์: ถ้าไม่เห็นบรรทัดนี้ = executor ไม่ได้รันโค้ดเลย ไม่ใช่บั๊กของ Macro
+print("[" .. APP_NAME .. "] เริ่มโหลดสคริปต์ build " .. APP_BUILD)
+
+-- ตรวจว่ามี GUI ของ Macro อยู่จริงในเกม (PlayerGui หรือ hidden UI container)
+-- ใช้แยก "อินสแตนซ์ที่ยังทำงานจริง" ออกจาก "อินสแตนซ์ค้าง" ที่ GUI ถูกเกมลบไปแล้ว
+local function macroGuiExists()
+    local function hasGui(container)
+        if typeof(container) ~= "Instance" then
+            return false
         end
-        if type(oldInstance.open) == "function" then
-            local opened = pcall(oldInstance.open)
-            if opened then
-                print("[ASTD Macro] พบอินสแตนซ์ที่ทำงานอยู่ — เปิดเมนูเดิมแทนการโหลดซ้ำ")
-                return
+        local ok, found = pcall(function()
+            for _, child in ipairs(container:GetChildren()) do
+                if child.Name == GUI_NAME and child:IsA("ScreenGui") then
+                    return true
+                end
             end
-        end
-        -- อินสแตนซ์รุ่นเก่าที่ไม่มีช่องทางเปิดเมนู: ปิดตัวเก่าก่อน แล้วโหลดใหม่แทน
-        if type(oldInstance.destroy) == "function" then
-            pcall(oldInstance.destroy)
-            print("[ASTD Macro] ปิดอินสแตนซ์รุ่นเก่าเพื่อป้องกันการทำงานซ้อน")
-        else
-            print("[ASTD Macro] พบอินสแตนซ์ที่ไม่รู้จัก — หยุดการโหลดซ้ำ")
-            return
+            return false
+        end)
+        return ok and found == true
+    end
+
+    local okPlayers, players = pcall(function()
+        return game:GetService("Players")
+    end)
+    if okPlayers and players then
+        local player = players.LocalPlayer
+        if player and hasGui(player:FindFirstChildOfClass("PlayerGui")) then
+            return true
         end
     end
+    if type(gethui) == "function" then
+        local ok, hidden = pcall(gethui)
+        if ok and hasGui(hidden) then
+            return true
+        end
+    end
+    return false
 end
 
-print("[ASTD Macro] Bootstrap 1/5: เริ่มต้น v2.0.1")
+-- ห้ามสร้างอินสแตนซ์ซ้ำ แต่ถ้าอินสแตนซ์เดิมเหลือแต่ handle ที่ไม่มี GUI แล้ว
+-- ต้องปิดตัวเก่าแล้วโหลดใหม่ ไม่งั้นผู้ใช้จะเห็น "เงียบสนิท" และไม่มีทางเปิดเมนูได้เลย
+local oldInstance = GENV.__ASTD_MACRO
+if type(oldInstance) == "table" and oldInstance.alive ~= false then
+    local reused = false
+    if macroGuiExists() then
+        if type(oldInstance.notifyDuplicate) == "function" then
+            reused = pcall(oldInstance.notifyDuplicate)
+        end
+        if not reused and type(oldInstance.open) == "function" then
+            reused = pcall(oldInstance.open)
+        end
+        -- setMenuVisible คืนค่าเงียบ ๆ เมื่อ GUI ถูกทำลาย จึงต้องตรวจซ้ำว่าเมนูกลับมาจริง
+        if reused and not macroGuiExists() then
+            reused = false
+        end
+    end
+    if reused then
+        print("[" .. APP_NAME .. "] พบอินสแตนซ์ที่ทำงานอยู่ — เปิดเมนูเดิมแทนการโหลดซ้ำ")
+        return
+    end
+    if type(oldInstance.destroy) == "function" then
+        pcall(oldInstance.destroy)
+        print("[" .. APP_NAME .. "] อินสแตนซ์เดิมใช้ต่อไม่ได้ — ปิดแล้วโหลดใหม่")
+    else
+        print("[" .. APP_NAME .. "] พบอินสแตนซ์ค้างที่ปิดไม่ได้ — ล้างสถานะแล้วโหลดใหม่")
+    end
+end
+GENV.__ASTD_MACRO = nil
+
+print("[" .. APP_NAME .. "] Bootstrap 1/5: เริ่มต้น v" .. APP_VERSION)
 
 -- ============================================================================
 -- 01) ค่าคงที่ บริการ และธีม
@@ -64,12 +111,6 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
-
-local APP_NAME = "ASTD Macro"
-local APP_VERSION = "2.0.1"
--- ใช้ตรวจว่าโหลดสคริปต์รุ่นล่าสุดจาก raw link จริง (ไม่เปลี่ยนเลขเวอร์ชัน)
-local APP_BUILD = "2026-10-27.4"
-local GUI_NAME = "ASTD_Macro_Menu"
 
 local ROOT_DIR = "ASTD_Macro"
 local PROFILE_DIR = ROOT_DIR .. "/profiles"
@@ -11453,6 +11494,10 @@ end
 local RuntimeHandle = {
     version = APP_VERSION,
     alive = true,
+    -- ใช้ให้สคริปต์รุ่นใหม่ตรวจได้ว่าอินสแตนซ์เดิมยังมี GUI จริงหรือเหลือแต่ handle ค้าง
+    getRoot = function()
+        return UI.screenGui
+    end,
 }
 
 function App.destroy()
