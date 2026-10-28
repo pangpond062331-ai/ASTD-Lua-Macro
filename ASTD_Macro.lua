@@ -28,7 +28,7 @@ end
 local APP_NAME = "ASTD Macro"
 local APP_VERSION = "2.0.1"
 -- ใช้ตรวจว่าโหลดสคริปต์รุ่นล่าสุดจาก raw link จริง (ไม่เปลี่ยนเลขเวอร์ชัน)
-local APP_BUILD = "2026-10-28.1"
+local APP_BUILD = "2026-10-28.2"
 local GUI_NAME = "ASTD_Macro_Menu"
 
 -- พิมพ์ตั้งแต่ต้นสคริปต์: ถ้าไม่เห็นบรรทัดนี้ = executor ไม่ได้รันโค้ดเลย ไม่ใช่บั๊กของ Macro
@@ -1222,6 +1222,7 @@ local State: any = {
     lastRecoveryWrite = 0,
     recordViewport = nil,
     playbackFailures = 0,
+    skippedWorldClicks = 0,
     playbackEvents = nil,
     worldFallbackWarned = false,
     worldProjectionFallbackWarned = false,
@@ -1480,6 +1481,10 @@ local DEFAULT_SETTINGS = {
     worldAnchor = true,
     worldFallback = false,
     worldThrough = false,
+    -- ค่าเริ่มต้น: เชื่อการวางของเกม ไม่ตรวจว่ามีวัตถุบัง (แบบเดียวกับมาโครทั่วไป)
+    worldTrust = true,
+    -- ค่าเริ่มต้น: จุดที่คลิกไม่ได้ให้ข้ามแล้วเล่นต่อ ไม่ล้มทั้งรอบ
+    worldSkipInvalid = true,
     noMouseMove = true,
     scaleCoords = false,
     offsetX = 0,
@@ -1523,6 +1528,8 @@ local function loadSettings()
     Settings.worldAnchor = boolOr(data.worldAnchor, true)
     Settings.worldFallback = boolOr(data.worldFallback, false)
     Settings.worldThrough = boolOr(data.worldThrough, false)
+    Settings.worldTrust = boolOr(data.worldTrust, true)
+    Settings.worldSkipInvalid = boolOr(data.worldSkipInvalid, true)
     Settings.noMouseMove = boolOr(data.noMouseMove, true)
     Settings.scaleCoords = boolOr(data.scaleCoords, Settings.scaleCoords)
     Settings.offsetX = math.floor(math.clamp(numberOr(data.offsetX, Settings.offsetX), -1000, 1000))
@@ -1562,6 +1569,8 @@ local function saveSettings()
         worldAnchor = Settings.worldAnchor ~= false,
         worldFallback = Settings.worldFallback == true,
         worldThrough = Settings.worldThrough == true,
+        worldTrust = Settings.worldTrust ~= false,
+        worldSkipInvalid = Settings.worldSkipInvalid ~= false,
         noMouseMove = Settings.noMouseMove ~= false,
         scaleCoords = Settings.scaleCoords,
         offsetX = Settings.offsetX,
@@ -5730,6 +5739,16 @@ local function buildUI()
             saveSettings()
         end)
 
+        UI.refs.worldTrustToggle = makeToggleRow(body, "คลิกจุดวางตามพิกัดเดิมโดยไม่ตรวจวัตถุบัง", Settings.worldTrust ~= false, "แบบเดียวกับมาโครทั่วไป: ให้เกมเป็นผู้เลือกช่องวางเอง • ไม่หยุดเพราะมีหน่วย/วัตถุบัง • ค่าเริ่มต้นเปิด", function(value)
+            Settings.worldTrust = value
+            saveSettings()
+        end)
+
+        UI.refs.worldSkipToggle = makeToggleRow(body, "ข้ามจุดที่คลิกไม่ได้แล้วเล่นต่อ", Settings.worldSkipInvalid ~= false, "ใช้เมื่อจุดเป้าหมายอยู่นอกจอหรือถูก UI บัง • สคริปต์จะไม่หมุนกล้องให้ • มีสรุปจำนวนจุดที่ข้ามท้ายรอบ", function(value)
+            Settings.worldSkipInvalid = value
+            saveSettings()
+        end)
+
         UI.refs.worldFallbackToggle = makeToggleRow(body, "ใช้พิกัดหน้าจอเดิมเมื่อจุดโลกอยู่นอกจอ", Settings.worldFallback, "ทางเลือกสำรองเมื่อกล้องตอนเล่นไม่ตรงกับตอนบันทึก • อาจคลิกผิดตำแหน่ง • ค่าเริ่มต้นปิด", function(value)
             Settings.worldFallback = value
             saveSettings()
@@ -6740,6 +6759,12 @@ function App.refreshSettingsUI()
     end
     if UI.refs.worldAnchorToggle then
         UI.refs.worldAnchorToggle.set(Settings.worldAnchor ~= false, false)
+    end
+    if UI.refs.worldTrustToggle then
+        UI.refs.worldTrustToggle.set(Settings.worldTrust ~= false, false)
+    end
+    if UI.refs.worldSkipToggle then
+        UI.refs.worldSkipToggle.set(Settings.worldSkipInvalid ~= false, false)
     end
     if UI.refs.worldFallbackToggle then
         UI.refs.worldFallbackToggle.set(Settings.worldFallback == true, false)
@@ -9393,6 +9418,12 @@ local function resolveWorldEventPoint(event)
     if not checked then
         return nil, nil, "ตรวจสอบ GUI ไม่ได้ จึงยืนยันไม่ได้ว่าจุดโลกไม่ถูก UI บัง"
     end
+    if Settings.worldTrust ~= false then
+        -- โหมดเชื่อเกม (ค่าเริ่มต้น): คลิกที่พิกัดซึ่งฉายจากจุดโลกเดิมทันที
+        -- ไม่ตรวจว่ามีหน่วย/วัตถุบัง เพราะเกมเป็นผู้เลือกช่องวางจากคลิกเอง
+        -- การตรวจพื้นผิวทำให้หยุดทั้งรอบในจุดที่เกมยังวางได้ (เคสขั้นตอน 5/108)
+        return x, y, nil, nil, "world"
+    end
     local verified, verifyError, verifyInfo = verifyWorldHit(event.world, x, y)
     if not verified then
         -- เกมบางเกมใช้ preview/ghost ที่ขยับตามเมาส์: ต้องเลื่อนเมาส์เสมือนไปก่อน
@@ -9646,6 +9677,17 @@ local function applyEvent(event)
             end
             local x, y, mode, skip, resolveError = resolveEventPoint(event)
             if resolveError then
+                if event.world and Settings.worldSkipInvalid ~= false then
+                    State.skippedWorldClicks += 1
+                    State.skippedClicks[button] = true
+                    State.lastSyntheticWorldId = nil
+                    Log.add("warn", string.format(
+                        "ข้ามคลิกวางที่ขั้นตอน %s: %s",
+                        tostring(State.playbackIndex),
+                        tostring(resolveError)
+                    ))
+                    return
+                end
                 error(resolveError)
             end
             if skip then
@@ -9982,6 +10024,12 @@ local function runPlayback(token, events, loops, loopsDisplay, speed)
         total,
         formatDuration(events[total].t)
     ))
+    if State.skippedWorldClicks > 0 then
+        Log.add("warn", string.format(
+            "ข้ามจุดวางที่คลิกไม่ได้ %d จุดในรอบนี้ (อยู่นอกจอ/ถูก UI บัง) — สคริปต์ไม่หมุนกล้องให้",
+            State.skippedWorldClicks
+        ))
+    end
     updateProgress(total, total, loop, loopsDisplay)
     State.playbackEvents = nil
     if State.autoHidden then
@@ -10099,6 +10147,7 @@ function App.startPlayback(options)
     State.loop = 1
     State.autoHidden = false
     State.playbackFailures = 0
+    State.skippedWorldClicks = 0
     State.playbackEvents = events
     State.worldFallbackWarned = false
     State.worldProjectionFallbackWarned = false
